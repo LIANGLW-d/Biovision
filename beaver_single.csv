@@ -1,0 +1,2 @@
+image_path,has_beaver,confidence,reason,bbox,model_id,error
+/Users/qiongran.h/Downloads/dfw-beaver-aug-ohio/original/train/beaver/beavertail_20240501_211829_05010513.jpg,True,0.92,"Clear beaver visible on log showing characteristic dark rounded body, and distinctive large flat paddle-shaped tail visible below. Classic beaver posture and body shape on fallen timber near water.",,arn:aws:bedrock:us-east-2:727117753557:inference-profile/us.anthropic.claude-opus-4-5-20251101-v1:0,
