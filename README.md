@@ -53,6 +53,12 @@ Bounding box mode:
 beaver-id s3://my-bucket/path/prefix/ --task bbox --output beaver_bbox.csv
 ```
 
+## Gradio UI
+```bash
+beaver-id-ui
+```
+Then open the local URL shown in the terminal.
+
 ## Tests
 ```bash
 python -m unittest
