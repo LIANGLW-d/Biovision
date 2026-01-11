@@ -1,0 +1,28 @@
+[project]
+name = "dfw-beaver-id"
+version = "0.1.0"
+description = "CLI for batch beaver detection on images using AWS-backed models."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "dfw-beaver-id" }
+]
+keywords = ["aws", "cli", "computer-vision", "beaver"]
+dependencies = [
+  "boto3>=1.34.0",
+  "python-dotenv>=1.0.0",
+  "pillow>=10.0.0",
+]
+
+[project.scripts]
+beaver-id = "beaver_id.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
