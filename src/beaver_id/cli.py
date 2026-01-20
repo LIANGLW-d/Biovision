@@ -4,12 +4,15 @@ import io
 import json
 import os
 import pathlib
+import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 from urllib.parse import urlparse
 
 import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 from dotenv import load_dotenv
 from PIL import Image
 
@@ -159,21 +162,45 @@ def call_bedrock(
     prompt: str,
     max_tokens: int,
 ) -> dict:
-    resp = bedrock_client.converse(
-        modelId=model_id,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"image": {"format": "jpeg", "source": {"bytes": jpeg_bytes}}},
-                    {"text": prompt},
+    max_retries = int(env_default("BEAVER_BEDROCK_MAX_RETRIES", "3"))
+    backoff_base = float(env_default("BEAVER_BEDROCK_BACKOFF_BASE", "1.0"))
+    backoff_max = float(env_default("BEAVER_BEDROCK_BACKOFF_MAX", "10.0"))
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = bedrock_client.converse(
+                modelId=model_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"image": {"format": "jpeg", "source": {"bytes": jpeg_bytes}}},
+                            {"text": prompt},
+                        ],
+                    }
                 ],
+                inferenceConfig={"temperature": 0.0, "maxTokens": max_tokens},
+            )
+            text = resp["output"]["message"]["content"][0]["text"].strip()
+            return extract_json_object(text)
+        except (EndpointConnectionError, ReadTimeoutError) as exc:
+            if attempt >= max_retries:
+                raise exc
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            retryable = code in {
+                "ThrottlingException",
+                "TooManyRequestsException",
+                "ServiceQuotaExceededException",
+                "RequestTimeoutException",
             }
-        ],
-        inferenceConfig={"temperature": 0.0, "maxTokens": max_tokens},
-    )
-    text = resp["output"]["message"]["content"][0]["text"].strip()
-    return extract_json_object(text)
+            if not retryable or attempt >= max_retries:
+                raise exc
+
+        delay = min(backoff_max, backoff_base * (2**attempt)) + random.uniform(0, 0.5)
+        time.sleep(delay)
+
+    raise RuntimeError("Bedrock request failed after retries.")
 
 
 def detect_beaver(

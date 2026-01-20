@@ -1,15 +1,28 @@
 import io
 import os
+import pathlib
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from typing import Any
+from typing import Any, Iterable
+import time
+
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "0")
 
 import boto3
 import gradio as gr
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 
-from beaver_id.cli import detect_beaver, extract_json_object, shrink_to_jpeg_under_5mb
+from beaver_id.cli import (
+    IMAGE_EXTENSIONS,
+    detect_beaver,
+    error_row,
+    iter_input_images,
+    normalize_row,
+    shrink_to_jpeg_under_5mb,
+    write_csv,
+)
 
 
 def env_default(name: str, default: str | None = None) -> str | None:
@@ -99,6 +112,125 @@ def run_s3_path(
     return data, preview
 
 
+def run_batch_upload(
+    file_paths: list[str] | None,
+    task: str,
+    model_id: str,
+    aws_region: str | None,
+    aws_profile: str | None,
+    max_dim: int,
+    max_workers: int,
+    batch_size: int,
+    batch_pause_sec: float,
+):
+    if not file_paths:
+        return [], None, "No files provided."
+
+    max_workers = max(1, int(max_workers))
+    batch_size = max(1, int(batch_size))
+    batch_pause_sec = max(0.0, float(batch_pause_sec))
+
+    image_paths = [
+        path for path in file_paths if pathlib.Path(path).suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    if not image_paths:
+        return [], None, "No supported image files provided."
+
+    bedrock_client, s3_client = build_clients_cached(aws_region, aws_profile)
+
+    def _run(path: str) -> dict:
+        data = detect_beaver(path, bedrock_client, s3_client, model_id, task, max_dim)
+        return normalize_row(path, data, model_id)
+
+    def batched(items: list[str], size: int) -> Iterable[list[str]]:
+        for i in range(0, len(items), size):
+            yield items[i : i + size]
+
+    rows: list[dict] = []
+    for batch in batched(image_paths, batch_size):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run, path): path for path in batch}
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    rows.append(future.result())
+                except Exception as exc:
+                    rows.append(error_row(path, model_id, exc))
+        if batch_pause_sec:
+            time.sleep(batch_pause_sec)
+
+    rows.sort(key=lambda row: row["image_path"])
+    beaver_rows = [row for row in rows if row.get("has_beaver") is True]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as handle:
+        output_path = pathlib.Path(handle.name)
+    write_csv(rows, output_path)
+
+    return (
+        beaver_rows,
+        str(output_path),
+        f"Processed {len(rows)} images. Beaver detected in {len(beaver_rows)} images.",
+    )
+
+
+def run_s3_batch(
+    s3_prefix: str,
+    task: str,
+    model_id: str,
+    aws_region: str | None,
+    aws_profile: str | None,
+    max_dim: int,
+    max_workers: int,
+    limit: int,
+    batch_size: int,
+    batch_pause_sec: float,
+):
+    if not s3_prefix:
+        return [], None, "No S3 prefix provided."
+
+    max_workers = max(1, int(max_workers))
+    batch_size = max(1, int(batch_size))
+    batch_pause_sec = max(0.0, float(batch_pause_sec))
+
+    bedrock_client, s3_client = build_clients_cached(aws_region, aws_profile)
+    limit_value = None if limit <= 0 else limit
+    image_paths = list(iter_input_images(s3_prefix, s3_client, limit_value))
+    if not image_paths:
+        return [], None, "No images found for prefix."
+
+    def _run(path: str) -> dict:
+        data = detect_beaver(path, bedrock_client, s3_client, model_id, task, max_dim)
+        return normalize_row(path, data, model_id)
+
+    def batched(items: list[str], size: int) -> Iterable[list[str]]:
+        for i in range(0, len(items), size):
+            yield items[i : i + size]
+
+    rows: list[dict] = []
+    for batch in batched(image_paths, batch_size):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run, path): path for path in batch}
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    rows.append(future.result())
+                except Exception as exc:
+                    rows.append(error_row(path, model_id, exc))
+        if batch_pause_sec:
+            time.sleep(batch_pause_sec)
+
+    rows.sort(key=lambda row: row["image_path"])
+    beaver_rows = [row for row in rows if row.get("has_beaver") is True]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as handle:
+        output_path = pathlib.Path(handle.name)
+    write_csv(rows, output_path)
+
+    return (
+        beaver_rows,
+        str(output_path),
+        f"Processed {len(rows)} images. Beaver detected in {len(beaver_rows)} images.",
+    )
+
+
 def build_app() -> gr.Blocks:
     load_dotenv()
 
@@ -113,6 +245,8 @@ def build_app() -> gr.Blocks:
     )
     default_task = env_default("BEAVER_TASK", "classify")
     default_max_dim = int(env_default("BEAVER_MAX_DIM", "2048"))
+    default_batch_size = int(env_default("BEAVER_BATCH_SIZE", "20"))
+    default_batch_pause = float(env_default("BEAVER_BATCH_PAUSE_SEC", "0"))
 
     with gr.Blocks(title="Beaver Detector") as demo:
         gr.Markdown("# Beaver Detector")
@@ -151,12 +285,68 @@ def build_app() -> gr.Blocks:
                 outputs=[s3_result_json, s3_bbox_preview],
             )
 
+        with gr.Tab("S3 Batch"):
+            s3_prefix = gr.Textbox(
+                label="S3 Prefix",
+                placeholder="s3://bucket/prefix/",
+            )
+            s3_limit = gr.Number(value=0, label="Limit (0 = no limit)")
+            s3_workers = gr.Number(value=4, label="Max Workers")
+            s3_batch_size = gr.Number(value=default_batch_size, label="Batch Size")
+            s3_batch_pause = gr.Number(value=default_batch_pause, label="Batch Pause (sec)")
+            run_s3_batch_button = gr.Button("Run Batch")
+            s3_batch_table = gr.JSON(label="Results")
+            s3_batch_csv = gr.File(label="Download CSV")
+            s3_batch_status = gr.Textbox(label="Status")
+            run_s3_batch_button.click(
+                run_s3_batch,
+                inputs=[
+                    s3_prefix,
+                    task,
+                    model_id,
+                    aws_region,
+                    aws_profile,
+                    max_dim,
+                    s3_workers,
+                    s3_limit,
+                    s3_batch_size,
+                    s3_batch_pause,
+                ],
+                outputs=[s3_batch_table, s3_batch_csv, s3_batch_status],
+            )
+
+        with gr.Tab("Batch Upload"):
+            batch_files = gr.Files(label="Images", file_count="multiple", type="filepath")
+            batch_workers = gr.Number(value=4, label="Max Workers")
+            batch_size = gr.Number(value=default_batch_size, label="Batch Size")
+            batch_pause = gr.Number(value=default_batch_pause, label="Batch Pause (sec)")
+            run_batch = gr.Button("Run Batch")
+            batch_table = gr.JSON(label="Results")
+            batch_csv = gr.File(label="Download CSV")
+            batch_status = gr.Textbox(label="Status")
+            run_batch.click(
+                run_batch_upload,
+                inputs=[
+                    batch_files,
+                    task,
+                    model_id,
+                    aws_region,
+                    aws_profile,
+                    max_dim,
+                    batch_workers,
+                    batch_size,
+                    batch_pause,
+                ],
+                outputs=[batch_table, batch_csv, batch_status],
+            )
+
     return demo
 
 
 def main() -> None:
     app = build_app()
-    app.launch()
+    share = env_default("BEAVER_GRADIO_SHARE", "false").lower() in {"1", "true", "yes"}
+    app.launch(share=share)
 
 
 if __name__ == "__main__":

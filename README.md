@@ -58,6 +58,14 @@ beaver-id s3://my-bucket/path/prefix/ --task bbox --output beaver_bbox.csv
 beaver-id-ui
 ```
 Then open the local URL shown in the terminal.
+To create a temporary public link:
+```bash
+BEAVER_GRADIO_SHARE=true beaver-id-ui
+```
+Batch tuning (optional):
+- `BEAVER_BATCH_SIZE` (default 20)
+- `BEAVER_BATCH_PAUSE_SEC` (default 0)
+- `BEAVER_BEDROCK_MAX_RETRIES` (default 3)
 
 ## Tests
 ```bash
