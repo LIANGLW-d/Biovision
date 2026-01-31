@@ -78,6 +78,11 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Local artifacts
+.DS_Store
+ocr_debug/
+beaver_results_*.csv
+
 # IPython
 profile_default/
 ipython_config.py
