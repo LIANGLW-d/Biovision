@@ -17,8 +17,12 @@ from PIL import Image, ImageDraw
 from beaver_id.cli import (
     IMAGE_EXTENSIONS,
     detect_beaver,
+    detect_animal,
+    detect_overlay_location,
     error_row,
     iter_input_images,
+    load_exif_location,
+    load_exif_timestamp,
     normalize_row,
     shrink_to_jpeg_under_5mb,
     write_csv,
@@ -62,49 +66,113 @@ def draw_bbox_on_image(image: Image.Image, bbox: list[float] | None) -> Image.Im
 
 
 def run_uploaded_image(
-    image: Image.Image | None,
+    file_path: str | None,
     task: str,
     model_id: str,
+    animal_model_id: str,
+    overlay_model_id: str,
+    overlay_codes: str,
+    run_exif: bool,
     aws_region: str | None,
     aws_profile: str | None,
     s3_region: str | None,
     max_dim: int,
+    run_animal: bool,
+    run_overlay: bool,
 ):
-    if image is None:
+    if not file_path:
         return {"error": "No image provided."}, None
 
     bedrock_client, s3_client = build_clients_cached(aws_region, aws_profile, s3_region)
-    with tempfile.NamedTemporaryFile(suffix=".jpg") as handle:
-        image.convert("RGB").save(handle.name, format="JPEG")
-        data = detect_beaver(
-            handle.name,
+    image = Image.open(file_path).convert("RGB")
+    animal_data = None
+    if run_animal:
+        animal_data = detect_animal(
+            file_path,
             bedrock_client,
             s3_client,
-            model_id,
-            task,
+            animal_model_id,
             max_dim,
         )
+    overlay_data = None
+    if run_overlay:
+        codes = [code.strip() for code in overlay_codes.split(",") if code.strip()]
+        overlay_data = detect_overlay_location(
+            file_path,
+            bedrock_client,
+            s3_client,
+            overlay_model_id,
+            max_dim,
+            codes,
+        )
+    exif_timestamp = ""
+    exif_location = ""
+    if run_exif:
+        exif_timestamp = load_exif_timestamp(file_path, s3_client)
+        exif_location = load_exif_location(file_path, s3_client)
+    data = detect_beaver(
+        file_path,
+        bedrock_client,
+        s3_client,
+        model_id,
+        task,
+        max_dim,
+    )
 
     bbox_image = None
     if task == "bbox":
-        bbox_image = draw_bbox_on_image(image.convert("RGB"), data.get("bbox"))
+        bbox_image = draw_bbox_on_image(image, data.get("bbox"))
 
-    return data, bbox_image
+    row = normalize_row(file_path, data, model_id, animal_data, overlay_data)
+    row["exif_timestamp"] = exif_timestamp
+    row["exif_location"] = exif_location
+    return row, bbox_image
 
 
 def run_s3_path(
     s3_path: str,
     task: str,
     model_id: str,
+    animal_model_id: str,
+    overlay_model_id: str,
+    overlay_codes: str,
+    run_exif: bool,
     aws_region: str | None,
     aws_profile: str | None,
     s3_region: str | None,
     max_dim: int,
+    run_animal: bool,
+    run_overlay: bool,
 ):
     if not s3_path:
         return {"error": "No S3 path provided."}, None
 
     bedrock_client, s3_client = build_clients_cached(aws_region, aws_profile, s3_region)
+    animal_data = None
+    if run_animal:
+        animal_data = detect_animal(
+            s3_path,
+            bedrock_client,
+            s3_client,
+            animal_model_id,
+            max_dim,
+        )
+    overlay_data = None
+    if run_overlay:
+        codes = [code.strip() for code in overlay_codes.split(",") if code.strip()]
+        overlay_data = detect_overlay_location(
+            s3_path,
+            bedrock_client,
+            s3_client,
+            overlay_model_id,
+            max_dim,
+            codes,
+        )
+    exif_timestamp = ""
+    exif_location = ""
+    if run_exif:
+        exif_timestamp = load_exif_timestamp(s3_path, s3_client)
+        exif_location = load_exif_location(s3_path, s3_client)
     data = detect_beaver(s3_path, bedrock_client, s3_client, model_id, task, max_dim)
 
     preview = None
@@ -117,13 +185,20 @@ def run_s3_path(
         image = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
         preview = draw_bbox_on_image(image, data.get("bbox"))
 
-    return data, preview
+    row = normalize_row(s3_path, data, model_id, animal_data, overlay_data)
+    row["exif_timestamp"] = exif_timestamp
+    row["exif_location"] = exif_location
+    return row, preview
 
 
 def run_batch_upload(
     file_paths: list[str] | None,
     task: str,
     model_id: str,
+    animal_model_id: str,
+    overlay_model_id: str,
+    overlay_codes: str,
+    run_exif: bool,
     aws_region: str | None,
     aws_profile: str | None,
     s3_region: str | None,
@@ -131,6 +206,8 @@ def run_batch_upload(
     max_workers: int,
     batch_size: int,
     batch_pause_sec: float,
+    run_animal: bool,
+    run_overlay: bool,
 ):
     if not file_paths:
         return [], None, "No files provided."
@@ -148,8 +225,36 @@ def run_batch_upload(
     bedrock_client, s3_client = build_clients_cached(aws_region, aws_profile, s3_region)
 
     def _run(path: str) -> dict:
+        animal_data = None
+        if run_animal:
+            animal_data = detect_animal(
+                path,
+                bedrock_client,
+                s3_client,
+                animal_model_id,
+                max_dim,
+            )
+        overlay_data = None
+        if run_overlay:
+            codes = [code.strip() for code in overlay_codes.split(",") if code.strip()]
+            overlay_data = detect_overlay_location(
+                path,
+                bedrock_client,
+                s3_client,
+                overlay_model_id,
+                max_dim,
+                codes,
+            )
+        exif_timestamp = ""
+        exif_location = ""
+        if run_exif:
+            exif_timestamp = load_exif_timestamp(path, s3_client)
+            exif_location = load_exif_location(path, s3_client)
         data = detect_beaver(path, bedrock_client, s3_client, model_id, task, max_dim)
-        return normalize_row(path, data, model_id)
+        row = normalize_row(path, data, model_id, animal_data, overlay_data)
+        row["exif_timestamp"] = exif_timestamp
+        row["exif_location"] = exif_location
+        return row
 
     def batched(items: list[str], size: int) -> Iterable[list[str]]:
         for i in range(0, len(items), size):
@@ -185,6 +290,10 @@ def run_s3_batch(
     s3_prefix: str,
     task: str,
     model_id: str,
+    animal_model_id: str,
+    overlay_model_id: str,
+    overlay_codes: str,
+    run_exif: bool,
     aws_region: str | None,
     aws_profile: str | None,
     s3_region: str | None,
@@ -193,6 +302,8 @@ def run_s3_batch(
     limit: int,
     batch_size: int,
     batch_pause_sec: float,
+    run_animal: bool,
+    run_overlay: bool,
 ):
     if not s3_prefix:
         return [], None, "No S3 prefix provided."
@@ -208,8 +319,36 @@ def run_s3_batch(
         return [], None, "No images found for prefix."
 
     def _run(path: str) -> dict:
+        animal_data = None
+        if run_animal:
+            animal_data = detect_animal(
+                path,
+                bedrock_client,
+                s3_client,
+                animal_model_id,
+                max_dim,
+            )
+        overlay_data = None
+        if run_overlay:
+            codes = [code.strip() for code in overlay_codes.split(",") if code.strip()]
+            overlay_data = detect_overlay_location(
+                path,
+                bedrock_client,
+                s3_client,
+                overlay_model_id,
+                max_dim,
+                codes,
+            )
+        exif_timestamp = ""
+        exif_location = ""
+        if run_exif:
+            exif_timestamp = load_exif_timestamp(path, s3_client)
+            exif_location = load_exif_location(path, s3_client)
         data = detect_beaver(path, bedrock_client, s3_client, model_id, task, max_dim)
-        return normalize_row(path, data, model_id)
+        row = normalize_row(path, data, model_id, animal_data, overlay_data)
+        row["exif_timestamp"] = exif_timestamp
+        row["exif_location"] = exif_location
+        return row
 
     def batched(items: list[str], size: int) -> Iterable[list[str]]:
         for i in range(0, len(items), size):
@@ -258,6 +397,12 @@ def build_app() -> gr.Blocks:
     default_batch_size = int(env_default("BEAVER_BATCH_SIZE", "20"))
     default_batch_pause = float(env_default("BEAVER_BATCH_PAUSE_SEC", "0"))
     default_s3_region = env_default("S3_REGION")
+    default_run_animal = env_default("BEAVER_RUN_ANIMAL", "true").lower() in {"1", "true", "yes"}
+    default_animal_model_id = env_default("BEAVER_ANIMAL_MODEL_ID", default_model_id)
+    default_run_overlay = env_default("BEAVER_RUN_OVERLAY", "false").lower() in {"1", "true", "yes"}
+    default_overlay_codes = env_default("BEAVER_OVERLAY_CODES", "")
+    default_overlay_model_id = env_default("BEAVER_OVERLAY_MODEL_ID", default_model_id)
+    default_run_exif = env_default("BEAVER_RUN_EXIF", "false").lower() in {"1", "true", "yes"}
 
     with gr.Blocks(title="Beaver Detector") as demo:
         gr.Markdown("# Beaver Detector")
@@ -266,6 +411,21 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             task = gr.Radio(["classify", "bbox"], value=default_task, label="Task")
             model_id = gr.Textbox(value=default_model_id, label="Bedrock Model ID / ARN")
+            run_animal = gr.Checkbox(value=default_run_animal, label="Run Animal Detection")
+            run_overlay = gr.Checkbox(value=default_run_overlay, label="Read Overlay Location")
+            run_exif = gr.Checkbox(value=default_run_exif, label="Read EXIF")
+        animal_model_id = gr.Textbox(
+            value=default_animal_model_id,
+            label="Animal Model ID / ARN",
+        )
+        overlay_model_id = gr.Textbox(
+            value=default_overlay_model_id,
+            label="Overlay Model ID / ARN",
+        )
+        overlay_codes = gr.Textbox(
+            value=default_overlay_codes,
+            label="Overlay Allowed Codes (comma-separated, optional)",
+        )
         with gr.Row():
             aws_region = gr.Textbox(value=default_region or "", label="AWS Region")
             aws_profile = gr.Textbox(value=default_profile or "", label="AWS Profile")
@@ -273,13 +433,27 @@ def build_app() -> gr.Blocks:
             max_dim = gr.Number(value=default_max_dim, label="Max Image Dimension")
 
         with gr.Tab("Upload Image"):
-            upload = gr.Image(type="pil", label="Image")
+            upload = gr.File(label="Image File", file_types=["image"])
             run_upload = gr.Button("Run")
             result_json = gr.JSON(label="Result")
             bbox_preview = gr.Image(type="pil", label="BBox Preview")
             run_upload.click(
                 run_uploaded_image,
-                inputs=[upload, task, model_id, aws_region, aws_profile, s3_region, max_dim],
+                inputs=[
+                    upload,
+                    task,
+                    model_id,
+                    animal_model_id,
+                    overlay_model_id,
+                    overlay_codes,
+                    run_exif,
+                    aws_region,
+                    aws_profile,
+                    s3_region,
+                    max_dim,
+                    run_animal,
+                    run_overlay,
+                ],
                 outputs=[result_json, bbox_preview],
             )
 
@@ -293,7 +467,21 @@ def build_app() -> gr.Blocks:
             s3_bbox_preview = gr.Image(type="pil", label="BBox Preview")
             run_s3.click(
                 run_s3_path,
-                inputs=[s3_path, task, model_id, aws_region, aws_profile, s3_region, max_dim],
+                inputs=[
+                    s3_path,
+                    task,
+                    model_id,
+                    animal_model_id,
+                    overlay_model_id,
+                    overlay_codes,
+                    run_exif,
+                    aws_region,
+                    aws_profile,
+                    s3_region,
+                    max_dim,
+                    run_animal,
+                    run_overlay,
+                ],
                 outputs=[s3_result_json, s3_bbox_preview],
             )
 
@@ -316,6 +504,10 @@ def build_app() -> gr.Blocks:
                     s3_prefix,
                     task,
                     model_id,
+                    animal_model_id,
+                    overlay_model_id,
+                    overlay_codes,
+                    run_exif,
                     aws_region,
                     aws_profile,
                     s3_region,
@@ -324,6 +516,8 @@ def build_app() -> gr.Blocks:
                     s3_limit,
                     s3_batch_size,
                     s3_batch_pause,
+                    run_animal,
+                    run_overlay,
                 ],
                 outputs=[s3_batch_table, s3_batch_csv, s3_batch_status],
             )
@@ -343,6 +537,10 @@ def build_app() -> gr.Blocks:
                     batch_files,
                     task,
                     model_id,
+                    animal_model_id,
+                    overlay_model_id,
+                    overlay_codes,
+                    run_exif,
                     aws_region,
                     aws_profile,
                     s3_region,
@@ -350,6 +548,8 @@ def build_app() -> gr.Blocks:
                     batch_workers,
                     batch_size,
                     batch_pause,
+                    run_animal,
+                    run_overlay,
                 ],
                 outputs=[batch_table, batch_csv, batch_status],
             )

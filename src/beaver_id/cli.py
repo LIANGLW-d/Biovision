@@ -15,6 +15,7 @@ import boto3
 from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 from dotenv import load_dotenv
 from PIL import Image
+from PIL.ExifTags import TAGS
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 
@@ -26,6 +27,35 @@ CLASSIFY_PROMPT = (
     "Return STRICT JSON only:\n"
     '{"is_beaver": true/false, "confidence": 0-1, "reason": "short"}'
 )
+
+BASIC_ANIMAL_PROMPT = """
+You are a wildlife image classification assistant.
+
+Task:
+Decide whether there is ANY animal in the image.
+If there is an animal, identify the most likely species.
+If the animal cannot be confidently identified, respond with "unknown".
+
+Animal definition:
+- Any real animal (mammal, bird, reptile, amphibian)
+- Can be partial, far away, blurred, low-light, silhouette
+
+Rules:
+- If there is ANY reasonable evidence of an animal, answer YES.
+- If uncertain, lean toward YES.
+- Do NOT count logs, rocks, shadows, plants, or water ripples.
+- Do NOT guess species if there is no clear visual evidence.
+
+Return STRICT JSON only:
+{
+  "has_animal": true or false,
+  "animal_type": "beaver | raccoon | deer | otter | bird | unknown | none",
+  "confidence": 0-1,
+  "reason": "short"
+}
+
+Output MUST start with { and end with } and contain nothing else.
+""".strip()
 
 BBOX_PROMPT = """
 You are a wildlife vision annotator.
@@ -45,6 +75,21 @@ Output MUST start with "{" and end with "}" and contain nothing else.
 Rules:
 - If no beaver, set bbox to null.
 - Coordinates must be within [0,1].
+""".strip()
+
+OVERLAY_LOCATION_PROMPT_TEMPLATE = """
+You read trail camera overlays. Extract the site/location code from the overlay text.
+
+{allowed_codes_line}
+
+Return STRICT JSON only:
+{{
+  "location_code": "<exact code from overlay or 'unknown'>",
+  "confidence": 0-1,
+  "reason": "short"
+}}
+
+Output MUST start with {{ and end with }} and contain nothing else.
 """.strip()
 
 
@@ -123,6 +168,73 @@ def load_image_bytes(image_path: str, s3_client) -> bytes:
         obj = s3_client.get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"))
         return obj["Body"].read()
     return pathlib.Path(image_path).read_bytes()
+
+
+def extract_exif_timestamp(image_bytes: bytes) -> str:
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        exif = image.getexif()
+        if not exif:
+            return ""
+        exif_dict = {TAGS.get(tag_id, tag_id): value for tag_id, value in exif.items()}
+        return (
+            exif_dict.get("DateTimeOriginal")
+            or exif_dict.get("DateTimeDigitized")
+            or exif_dict.get("DateTime")
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _to_float(value) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _gps_coord_to_decimal(coord, ref: str | None) -> float | None:
+    try:
+        degrees = _to_float(coord[0])
+        minutes = _to_float(coord[1])
+        seconds = _to_float(coord[2])
+        if degrees is None or minutes is None or seconds is None:
+            return None
+        decimal = degrees + minutes / 60.0 + seconds / 3600.0
+        if ref in {"S", "W"}:
+            decimal *= -1
+        return decimal
+    except Exception:
+        return None
+
+
+def extract_exif_location(image_bytes: bytes) -> str:
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        exif = image.getexif()
+        if not exif:
+            return ""
+        exif_dict = {TAGS.get(tag_id, tag_id): value for tag_id, value in exif.items()}
+        gps_info = exif_dict.get("GPSInfo")
+        if not gps_info:
+            return ""
+        gps = {TAGS.get(tag_id, tag_id): value for tag_id, value in gps_info.items()}
+        lat = _gps_coord_to_decimal(gps.get("GPSLatitude"), gps.get("GPSLatitudeRef"))
+        lon = _gps_coord_to_decimal(gps.get("GPSLongitude"), gps.get("GPSLongitudeRef"))
+        if lat is None or lon is None:
+            return ""
+        return f"{lat:.6f},{lon:.6f}"
+    except Exception:
+        return ""
+
+
+def load_exif_timestamp(image_path: str, s3_client) -> str:
+    return extract_exif_timestamp(load_image_bytes(image_path, s3_client))
+
+
+def load_exif_location(image_path: str, s3_client) -> str:
+    return extract_exif_location(load_image_bytes(image_path, s3_client))
 
 
 def shrink_to_jpeg_under_5mb(img_bytes: bytes, max_dim: int) -> bytes:
@@ -240,15 +352,78 @@ def detect_beaver(
     return data
 
 
-def normalize_row(image_path: str, data: dict, model_id: str) -> dict:
-    bbox = data.get("bbox")
+def detect_animal(
+    image_path: str,
+    bedrock_client,
+    s3_client,
+    model_id: str,
+    max_dim: int,
+) -> dict:
+    raw = load_image_bytes(image_path, s3_client)
+    jpeg_bytes = shrink_to_jpeg_under_5mb(raw, max_dim=max_dim)
+    return call_bedrock(
+        bedrock_client,
+        model_id,
+        jpeg_bytes,
+        prompt=BASIC_ANIMAL_PROMPT,
+        max_tokens=200,
+    )
+
+
+def detect_overlay_location(
+    image_path: str,
+    bedrock_client,
+    s3_client,
+    model_id: str,
+    max_dim: int,
+    allowed_codes: list[str],
+) -> dict:
+    raw = load_image_bytes(image_path, s3_client)
+    jpeg_bytes = shrink_to_jpeg_under_5mb(raw, max_dim=max_dim)
+    if allowed_codes:
+        allowed_line = f"Allowed codes: {', '.join(allowed_codes)}"
+    else:
+        allowed_line = (
+            "Return the full code as shown in the overlay (letters/numbers/underscore)."
+        )
+    prompt = OVERLAY_LOCATION_PROMPT_TEMPLATE.format(allowed_codes_line=allowed_line)
+    return call_bedrock(
+        bedrock_client,
+        model_id,
+        jpeg_bytes,
+        prompt=prompt,
+        max_tokens=150,
+    )
+
+
+def normalize_row(
+    image_path: str,
+    beaver_data: dict,
+    model_id: str,
+    animal_data: dict | None = None,
+    overlay_data: dict | None = None,
+) -> dict:
+    bbox = beaver_data.get("bbox")
     return {
         "image_path": image_path,
-        "has_beaver": bool(data.get("is_beaver")) if "is_beaver" in data else "",
-        "confidence": data.get("confidence", ""),
-        "reason": data.get("reason", ""),
+        "has_beaver": (
+            bool(beaver_data.get("is_beaver")) if "is_beaver" in beaver_data else ""
+        ),
+        "confidence": beaver_data.get("confidence", ""),
+        "reason": beaver_data.get("reason", ""),
         "bbox": json.dumps(bbox) if bbox is not None else "",
+        "has_animal": (
+            bool(animal_data.get("has_animal")) if animal_data and "has_animal" in animal_data else ""
+        ),
+        "animal_type": animal_data.get("animal_type", "") if animal_data else "",
+        "animal_confidence": animal_data.get("confidence", "") if animal_data else "",
+        "animal_reason": animal_data.get("reason", "") if animal_data else "",
+        "overlay_location": overlay_data.get("location_code", "") if overlay_data else "",
+        "overlay_confidence": overlay_data.get("confidence", "") if overlay_data else "",
+        "overlay_reason": overlay_data.get("reason", "") if overlay_data else "",
         "model_id": model_id,
+        "exif_timestamp": "",
+        "exif_location": "",
         "error": "",
     }
 
@@ -260,7 +435,16 @@ def error_row(image_path: str, model_id: str, error: Exception) -> dict:
         "confidence": "",
         "reason": "",
         "bbox": "",
+        "has_animal": "",
+        "animal_type": "",
+        "animal_confidence": "",
+        "animal_reason": "",
+        "overlay_location": "",
+        "overlay_confidence": "",
+        "overlay_reason": "",
         "model_id": model_id,
+        "exif_timestamp": "",
+        "exif_location": "",
         "error": str(error),
     }
 
@@ -272,7 +456,16 @@ def write_csv(rows: Iterable[dict], output_path: pathlib.Path) -> None:
         "confidence",
         "reason",
         "bbox",
+        "has_animal",
+        "animal_type",
+        "animal_confidence",
+        "animal_reason",
+        "overlay_location",
+        "overlay_confidence",
+        "overlay_reason",
         "model_id",
+        "exif_timestamp",
+        "exif_location",
         "error",
     ]
     with output_path.open("w", newline="") as handle:
@@ -315,6 +508,23 @@ def parse_args() -> argparse.Namespace:
         help="Inference task to run (classify or bbox).",
     )
     parser.add_argument(
+        "--run-animal",
+        action="store_true",
+        default=env_default("BEAVER_RUN_ANIMAL", "true").lower() in {"1", "true", "yes"},
+        help="Run animal detection before beaver detection.",
+    )
+    parser.add_argument(
+        "--animal-model-id",
+        default=env_default(
+            "BEAVER_ANIMAL_MODEL_ID",
+            env_default(
+                "BEAVER_MODEL_ID",
+                env_default("BEDROCK_MODEL_ID", "anthropic.claude-opus-4-5-20251101-v1:0"),
+            ),
+        ),
+        help="Bedrock modelId or inference profile ARN for animal detection.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=int(env_default("BEAVER_MAX_WORKERS", "4")),
@@ -331,6 +541,31 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(env_default("BEAVER_MAX_DIM", "2048")),
         help="Max dimension for resize before JPEG compression.",
+    )
+    parser.add_argument(
+        "--print-exif",
+        action="store_true",
+        help="Print EXIF timestamp for each image (if present).",
+    )
+    parser.add_argument(
+        "--overlay-location",
+        action="store_true",
+        help="Use Bedrock vision to extract overlay location code and print it.",
+    )
+    parser.add_argument(
+        "--overlay-to-csv",
+        action="store_true",
+        help="Include overlay location code in CSV output (if present).",
+    )
+    parser.add_argument(
+        "--overlay-codes",
+        default=env_default("BEAVER_OVERLAY_CODES", ""),
+        help="Comma-separated overlay location codes to allow (e.g., BT_,EBN_D0).",
+    )
+    parser.add_argument(
+        "--exif-to-csv",
+        action="store_true",
+        help="Include EXIF timestamp in CSV output (if present).",
     )
     parser.add_argument(
         "--aws-region",
@@ -353,6 +588,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     limit = None if args.limit == 0 else args.limit
+    overlay_codes = [code.strip() for code in args.overlay_codes.split(",") if code.strip()]
 
     bedrock_client, s3_client = build_clients(
         args.aws_region,
@@ -364,6 +600,40 @@ def main() -> None:
         raise SystemExit("No images found for input.")
 
     def _run(path: str) -> dict:
+        exif_timestamp = ""
+        exif_location = ""
+        overlay_data = None
+        if args.print_exif:
+            timestamp = load_exif_timestamp(path, s3_client)
+            label = timestamp if timestamp else "unknown"
+            exif_location = load_exif_location(path, s3_client)
+            location_label = exif_location if exif_location else "unknown"
+            print(f"EXIF timestamp: {label} | EXIF location: {location_label} | {path}")
+            exif_timestamp = timestamp
+        elif args.exif_to_csv:
+            exif_timestamp = load_exif_timestamp(path, s3_client)
+            exif_location = load_exif_location(path, s3_client)
+        if args.overlay_location or args.overlay_to_csv:
+            overlay_data = detect_overlay_location(
+                path,
+                bedrock_client,
+                s3_client,
+                args.model_id,
+                args.max_dim,
+                overlay_codes,
+            )
+            if args.overlay_location:
+                location = overlay_data.get("location_code", "unknown")
+                print(f"Overlay location: {location} | {path}")
+        animal_data = None
+        if args.run_animal:
+            animal_data = detect_animal(
+                path,
+                bedrock_client,
+                s3_client,
+                args.animal_model_id,
+                args.max_dim,
+            )
         data = detect_beaver(
             path,
             bedrock_client,
@@ -372,7 +642,10 @@ def main() -> None:
             args.task,
             args.max_dim,
         )
-        return normalize_row(path, data, args.model_id)
+        row = normalize_row(path, data, args.model_id, animal_data, overlay_data)
+        row["exif_timestamp"] = exif_timestamp
+        row["exif_location"] = exif_location
+        return row
 
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:

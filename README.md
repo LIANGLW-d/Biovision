@@ -29,6 +29,8 @@ AWS_REGION=us-east-2
 AWS_PROFILE=default
 S3_REGION=us-west-2
 BEAVER_BEDROCK_MODEL_ID=arn:aws:bedrock:us-east-2:727117753557:inference-profile/us.anthropic.claude-opus-4-5-20251101-v1:0
+BEAVER_ANIMAL_MODEL_ID=arn:aws:bedrock:us-east-2:727117753557:inference-profile/us.anthropic.claude-opus-4-5-20251101-v1:0
+BEAVER_RUN_ANIMAL=true
 BEAVER_TASK=classify
 BEAVER_MAX_WORKERS=4
 BEAVER_LIMIT=0
@@ -80,6 +82,10 @@ The CSV contains:
 - `confidence`: float confidence score.
 - `reason`: short model-provided rationale (classify task).
 - `bbox`: JSON array of normalized coords when using bbox task.
+- `has_animal`: boolean animal presence result.
+- `animal_type`: predicted animal species or `unknown`.
+- `animal_confidence`: confidence score for animal detection.
+- `animal_reason`: short rationale for animal detection.
 - `model_id`: AWS model identifier used for inference.
 - `error`: error string if inference failed for a given image.
 
