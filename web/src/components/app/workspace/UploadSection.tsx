@@ -104,8 +104,7 @@ const UploadSection = ({ files, s3Path, onUpload, onS3PathChange }: UploadSectio
         ref={folderInputRef}
         type="file"
         multiple
-        webkitdirectory="true"
-        directory="true"
+        {...({ webkitdirectory: "true", directory: "true" } as Record<string, string>)}
         onChange={handleFileChange}
         className="hidden"
       />
