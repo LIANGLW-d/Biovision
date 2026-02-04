@@ -15,7 +15,10 @@ export interface DetectionResult {
   model_id: string;
   has_beaver?: boolean;
   has_animal?: boolean;
+  Common_Name?: string;
+  manual_review?: boolean;
   animal_type?: string;
+  animal_group?: string;
   animal_confidence?: number | string;
   animal_reason?: string;
   bbox?: string;

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { postProcessAnimalOutput } from "@/lib/animalPostProcess";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -67,6 +68,12 @@ function rowToResult(row: CsvRow, index: number) {
         : "no_animal";
 
   const confidence = row.confidence ? Number(row.confidence) : 0;
+  const animalPost = postProcessAnimalOutput({
+    common_name: row.animal_type,
+    confidence: row.animal_confidence,
+    group: row.animal_group,
+    notes: row.animal_reason,
+  });
 
   return {
     id: `row_${index}`,
@@ -81,9 +88,12 @@ function rowToResult(row: CsvRow, index: number) {
     model_id: row.model_id || "",
     has_beaver: hasBeaver,
     has_animal: hasAnimal,
-    animal_type: row.animal_type || "",
-    animal_confidence: row.animal_confidence || "",
-    animal_reason: row.animal_reason || "",
+    Common_Name: animalPost.Common_Name,
+    manual_review: animalPost.manual_review,
+    animal_type: animalPost.Common_Name,
+    animal_group: row.animal_group || "",
+    animal_confidence: animalPost.confidence,
+    animal_reason: animalPost.notes,
     bbox: row.bbox || "",
     overlay_location: row.overlay_location || "",
     overlay_confidence: row.overlay_confidence || "",

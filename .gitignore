@@ -111,6 +111,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Allow web UI lib folder (ignored by global lib/ rule above)
+!web/src/lib/
+!web/src/lib/**
+
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more

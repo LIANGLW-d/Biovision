@@ -37,21 +37,28 @@ If there is an animal, identify the most likely species.
 If the animal cannot be confidently identified, respond with "unknown".
 
 Animal definition:
-- Any real animal (mammal, bird, reptile, amphibian)
+- Any real animal (mammal or bird)
 - Can be partial, far away, blurred, low-light, silhouette
+
+Allowed Common_Name values (exact casing):
+Beaver, Nutria, Raccoon, Black bear, Long-tailed weasel, Mink, River otter, Striped skunk,
+Bobcat, Mountain lion (Cougar), Coyote, Elk, Mule and black-tailed deer, human,
+Band-tailed pigeon, Barred owl, Western screech-owl, Great blue heron,
+other mammal, other bird, unknown, No animal
 
 Rules:
 - If there is ANY reasonable evidence of an animal, answer YES.
 - If uncertain, lean toward YES.
 - Do NOT count logs, rocks, shadows, plants, or water ripples.
 - Do NOT guess species if there is no clear visual evidence.
+- If you identify a species not on the list, choose "other mammal" or "other bird".
 
-Return STRICT JSON only:
+Return STRICT JSON only with:
 {
-  "has_animal": true or false,
-  "animal_type": "beaver | raccoon | deer | otter | bird | unknown | none",
+  "common_name": "<one of the allowed Common_Name values>",
   "confidence": 0-1,
-  "reason": "short"
+  "group": "mammal | bird | none | unknown",
+  "notes": "short"
 }
 
 Output MUST start with { and end with } and contain nothing else.
@@ -404,6 +411,18 @@ def normalize_row(
     overlay_data: dict | None = None,
 ) -> dict:
     bbox = beaver_data.get("bbox")
+    animal_group = ""
+    animal_common_name = ""
+    if animal_data:
+        animal_group = str(animal_data.get("group", "")).strip().lower()
+        animal_common_name = str(animal_data.get("common_name", "")).strip()
+    has_animal = ""
+    if animal_common_name or animal_group:
+        if animal_group == "none" or animal_common_name == "No animal":
+            has_animal = False
+        else:
+            has_animal = True
+
     return {
         "image_path": image_path,
         "has_beaver": (
@@ -412,12 +431,11 @@ def normalize_row(
         "confidence": beaver_data.get("confidence", ""),
         "reason": beaver_data.get("reason", ""),
         "bbox": json.dumps(bbox) if bbox is not None else "",
-        "has_animal": (
-            bool(animal_data.get("has_animal")) if animal_data and "has_animal" in animal_data else ""
-        ),
-        "animal_type": animal_data.get("animal_type", "") if animal_data else "",
+        "has_animal": has_animal,
+        "animal_type": animal_common_name,
+        "animal_group": animal_group,
         "animal_confidence": animal_data.get("confidence", "") if animal_data else "",
-        "animal_reason": animal_data.get("reason", "") if animal_data else "",
+        "animal_reason": animal_data.get("notes", "") if animal_data else "",
         "overlay_location": overlay_data.get("location_code", "") if overlay_data else "",
         "overlay_confidence": overlay_data.get("confidence", "") if overlay_data else "",
         "overlay_reason": overlay_data.get("reason", "") if overlay_data else "",
@@ -437,6 +455,7 @@ def error_row(image_path: str, model_id: str, error: Exception) -> dict:
         "bbox": "",
         "has_animal": "",
         "animal_type": "",
+        "animal_group": "",
         "animal_confidence": "",
         "animal_reason": "",
         "overlay_location": "",
@@ -458,6 +477,7 @@ def write_csv(rows: Iterable[dict], output_path: pathlib.Path) -> None:
         "bbox",
         "has_animal",
         "animal_type",
+        "animal_group",
         "animal_confidence",
         "animal_reason",
         "overlay_location",
