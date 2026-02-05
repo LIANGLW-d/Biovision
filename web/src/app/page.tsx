@@ -446,7 +446,7 @@ export default function Home() {
           <div className="mt-auto rounded-2xl border border-[hsl(var(--border))] bg-white/80 p-3 text-xs text-[hsl(var(--muted-foreground))] shadow-sm">
             Local runner
             <p className="mt-1 text-[11px]">
-              Uses `/api/classify` (<=5 images) or `/api/jobs` (batch) + Bedrock chat.
+              Uses `/api/classify` ({"<=5"} images) or `/api/jobs` (batch) + Bedrock chat.
             </p>
           </div>
         </aside>
