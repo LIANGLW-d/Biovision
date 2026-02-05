@@ -198,7 +198,7 @@ async function classifyImageBuffer(modelId: string, imageBytes: Buffer) {
           role: "user",
           content: [
             { type: "text", text: CLASSIFY_PROMPT },
-            { type: "image", image: jpegBytes, mimeType: "image/jpeg" },
+            { type: "image", image: jpegBytes, mediaType: "image/jpeg" },
           ],
         },
       ],
@@ -211,7 +211,7 @@ async function classifyImageBuffer(modelId: string, imageBytes: Buffer) {
               role: "user",
               content: [
                 { type: "text", text: buildOverlayPrompt(allowedCodes, overlayAllowAny) },
-                { type: "image", image: jpegBytes, mimeType: "image/jpeg" },
+                { type: "image", image: jpegBytes, mediaType: "image/jpeg" },
               ],
             },
           ],
