@@ -1,5 +1,5 @@
 const FALLBACK_API_BASE =
-  "https://5msgbzoispubifxqqfxwr22veq0dwgfs.lambda-url.us-east-2.on.aws/";
+  "https://l8jfz274hk.execute-api.us-east-2.amazonaws.com";
 
 export function resolveBeaverApiBase() {
   const fromEnv =
