@@ -3,6 +3,7 @@
 import { DefaultChatTransport } from "ai";
 import { useChat } from "@ai-sdk/react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { postProcessAnimalOutput } from "@/lib/animalPostProcess";
 
 type DetectionResult = {
   id: string;
@@ -90,6 +91,13 @@ export default function Home() {
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState("");
   const [results, setResults] = useState<DetectionResult[]>([]);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<string>("");
+  const [jobCsvKey, setJobCsvKey] = useState<string>("");
+  const [jobProgress, setJobProgress] = useState<{ completed: number; total: number }>({
+    completed: 0,
+    total: 0,
+  });
 
   const [csvPath, setCsvPath] = useState("");
   const [modelId, setModelId] = useState("");
@@ -150,6 +158,80 @@ export default function Home() {
 
   const resultsCsv = useMemo(() => buildCsv(results), [results]);
 
+  const mapClassifyResults = (items: Array<{
+    filename: string;
+    is_beaver: boolean;
+    confidence: number;
+    common_name: string;
+    group: string;
+    notes: string;
+    overlay_location?: string;
+    overlay_confidence?: number;
+    overlay_reason?: string;
+    overlay_temperature?: string;
+    exif_timestamp?: string;
+  }>) => {
+    const timestamp = Date.now();
+    return items.map((result, index) => {
+      const post = postProcessAnimalOutput({
+        common_name: result.common_name,
+        confidence: result.confidence,
+        group: result.group,
+        notes: result.notes,
+      });
+
+      let commonName = post.Common_Name;
+      let manualReview = post.manual_review;
+      let confidence = post.confidence;
+      let group = result.group;
+
+      if (result.is_beaver) {
+        commonName = "Beaver";
+        manualReview = false;
+        group = "mammal";
+        confidence = result.confidence;
+      } else if (commonName === "No animal") {
+        group = "none";
+      }
+
+      const predictedLabel =
+        result.is_beaver
+          ? "beaver"
+          : commonName && commonName !== "No animal" && commonName !== "unknown"
+            ? "other_animal"
+            : "no_animal";
+
+      return {
+        id: `classify_${timestamp}_${index}`,
+        image_path: result.filename || "",
+        filename: result.filename || "",
+        predicted_label: predictedLabel,
+        review_label: predictedLabel,
+        was_corrected: false,
+        confidence,
+        reason: result.notes || "",
+        notes: post.notes || "",
+        model_id: "",
+        has_beaver: result.is_beaver,
+        has_animal: commonName !== "No animal",
+        Common_Name: commonName,
+        manual_review: manualReview,
+        animal_type: commonName,
+        animal_group: group,
+        animal_confidence: confidence,
+        animal_reason: result.notes || "",
+        bbox: "",
+        overlay_location: result.overlay_location || "",
+        overlay_confidence: result.overlay_confidence ?? "",
+        overlay_reason: result.overlay_reason || "",
+        overlay_temperature: result.overlay_temperature || "",
+        exif_timestamp: result.exif_timestamp || "",
+        exif_location: "",
+        error: "",
+      };
+    });
+  };
+
   const handleRunDetection = async () => {
     setRunError("");
     setIsRunning(true);
@@ -157,6 +239,8 @@ export default function Home() {
       const formData = new FormData();
       const s3 = s3Path.trim();
       const allFiles = [...files, ...folderFiles];
+      const useClassifyApi = !s3 && allFiles.length > 0 && allFiles.length <= 5;
+      const useJobsApi = Boolean(s3) || (!s3 && allFiles.length > 5);
 
       if (s3) {
         formData.set("s3Path", s3);
@@ -169,10 +253,13 @@ export default function Home() {
         }
       }
 
-      const response = await fetch("/api/beaver/run", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await fetch(
+        useClassifyApi ? "/api/classify" : useJobsApi ? "/api/jobs" : "/api/beaver/run",
+        {
+          method: "POST",
+          body: formData,
+        },
+      );
 
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
@@ -180,7 +267,53 @@ export default function Home() {
       }
 
       const payload = await response.json();
-      setResults(payload.results || []);
+
+      if (useJobsApi) {
+        const nextJobId = payload.job_id as string | undefined;
+        if (!nextJobId) {
+          throw new Error("Job creation failed.");
+        }
+        setJobId(nextJobId);
+        setJobStatus(payload.status || "queued");
+        setJobCsvKey("");
+        setJobProgress({ completed: 0, total: payload.total_images || 0 });
+
+        let attempts = 0;
+        const maxAttempts = Infinity;
+        while (attempts < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const jobResponse = await fetch(`/api/jobs/${nextJobId}`);
+          const jobPayload = await jobResponse.json();
+          setJobStatus(jobPayload.status || "");
+          setJobProgress({
+            completed: jobPayload.completed_images || 0,
+            total: jobPayload.total_images || 0,
+          });
+          if (jobPayload.status === "complete") {
+            const mapped = mapClassifyResults(jobPayload.results || []);
+            setResults(mapped);
+            setJobCsvKey(jobPayload.csv_s3_key || "");
+            break;
+          }
+          if (jobPayload.status === "error") {
+            throw new Error(jobPayload.error || "Job failed.");
+          }
+          attempts += 1;
+        }
+      } else if (useClassifyApi) {
+        const mapped = mapClassifyResults(payload.results || []);
+        setResults(mapped);
+        setJobId(null);
+        setJobStatus("");
+        setJobCsvKey("");
+        setJobProgress({ completed: 0, total: 0 });
+      } else {
+        setResults(payload.results || []);
+        setJobId(null);
+        setJobStatus("");
+        setJobCsvKey("");
+        setJobProgress({ completed: 0, total: 0 });
+      }
       setCsvText("");
       setCsvPath("");
       setCsvName("");
@@ -215,6 +348,23 @@ export default function Home() {
     const link = document.createElement("a");
     link.href = url;
     link.download = "beaver_results_reviewed.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadJobCsv = async () => {
+    if (!jobId || !jobCsvKey) return;
+    const response = await fetch(`/api/jobs/${jobId}/csv`);
+    if (!response.ok) {
+      return;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `job_${jobId}_results.csv`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -377,6 +527,44 @@ export default function Home() {
                   >
                     {isRunning ? "Running detection..." : "Run detection"}
                   </button>
+                  {jobStatus && (
+                    <div className="space-y-2 text-xs text-[hsl(var(--muted-foreground))]">
+                      <p>
+                        Job status: <span className="font-semibold">{jobStatus}</span>
+                        {jobProgress.total > 0 && (
+                          <span className="ml-2">
+                            {jobProgress.completed}/{jobProgress.total}
+                          </span>
+                        )}
+                      </p>
+                      {jobProgress.total > 0 && (
+                        <div>
+                          <div className="h-2 w-full overflow-hidden rounded-full bg-[hsl(var(--border))]">
+                            <div
+                              className="h-full rounded-full bg-[hsl(var(--accent))] transition-all"
+                              style={{
+                                width: `${Math.min(
+                                  100,
+                                  Math.round(
+                                    (jobProgress.completed / jobProgress.total) * 100,
+                                  ),
+                                )}%`,
+                              }}
+                            />
+                          </div>
+                          <p className="mt-1 text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
+                            {Math.min(
+                              100,
+                              Math.round(
+                                (jobProgress.completed / jobProgress.total) * 100,
+                              ),
+                            )}
+                            % complete
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -418,6 +606,15 @@ export default function Home() {
                 >
                   Download reviewed CSV
                 </button>
+                {jobCsvKey && (
+                  <button
+                    type="button"
+                    onClick={handleDownloadJobCsv}
+                    className="mt-3 w-full rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))] px-4 py-3 text-sm font-semibold shadow-sm"
+                  >
+                    Download job CSV
+                  </button>
+                )}
               </div>
             </section>
             ) : (
@@ -722,6 +919,12 @@ export default function Home() {
                                         </span>
                                       </div>
                                       <div className="flex justify-between">
+                                        <span>Overlay site</span>
+                                        <span className="font-semibold">
+                                          {row.overlay_location || "—"}
+                                        </span>
+                                      </div>
+                                      <div className="flex justify-between">
                                         <span>EXIF time</span>
                                         <span className="font-semibold">
                                           {row.exif_timestamp || "—"}
@@ -731,6 +934,18 @@ export default function Home() {
                                         <span>Animal reason</span>
                                         <span className="font-semibold">
                                           {row.animal_reason || "—"}
+                                        </span>
+                                      </div>
+                                      <div className="flex justify-between">
+                                        <span>Overlay reason</span>
+                                        <span className="font-semibold">
+                                          {row.overlay_reason || "—"}
+                                        </span>
+                                      </div>
+                                      <div className="flex justify-between">
+                                        <span>Overlay temp</span>
+                                        <span className="font-semibold">
+                                          {row.overlay_temperature || "—"}
                                         </span>
                                       </div>
                                       <div className="flex justify-between">
