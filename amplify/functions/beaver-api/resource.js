@@ -1,9 +1,8 @@
 const { defineFunction } = require("@aws-amplify/backend");
-const path = require("node:path");
 
 exports.beaverApi = defineFunction({
   name: "beaver-api",
   runtime: 18,
   entry: "./index.js",
-  depsLockFilePath: "amplify/functions/beaver-api/package-lock.json",
+  depsLockFilePath: "functions/beaver-api/package-lock.json",
 });
