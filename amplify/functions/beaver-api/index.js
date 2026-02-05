@@ -112,6 +112,11 @@ function parseS3Path(value) {
   return { bucket, prefix };
 }
 
+function inferS3Region(bucket) {
+  const match = bucket.match(/-(us-[a-z]+-\d)$/);
+  return match ? match[1] : null;
+}
+
 async function streamToBuffer(stream) {
   const chunks = [];
   for await (const chunk of stream) {
@@ -317,7 +322,7 @@ async function handleClassify(event) {
 async function handleJobs(event) {
   const { fields, files } = await parseMultipart(event);
   const uploadFiles = files.filter((file) => file.fieldName === "files");
-  const s3Path = String(fields.s3Path || "").trim();
+  const s3Path = String(fields.s3Path || fields.s3_path || "").trim();
 
   if (uploadFiles.length === 0 && !s3Path) {
     return jsonResponse(400, { error: "No files or S3 path provided." });
@@ -329,7 +334,8 @@ async function handleJobs(event) {
   const jobId = randomUUID();
   const bucket = requireEnv("BEAVER_JOB_BUCKET");
   const region = requireEnv("AWS_REGION");
-  const s3Region = process.env.S3_REGION || region;
+  let s3Region =
+    fields.s3Region || fields.s3_region || process.env.S3_REGION || region;
   const modelId =
     fields.modelId ||
     process.env.BEAVER_BEDROCK_MODEL_ID ||
@@ -341,18 +347,29 @@ async function handleJobs(event) {
     });
   }
 
-  const s3Client = new S3Client({ region: s3Region });
+  let parsedS3;
   let s3Inputs = [];
   if (s3Path) {
-    const parsed = parseS3Path(s3Path);
-    const keys = await listS3Images(s3Client, parsed.bucket, parsed.prefix);
+    parsedS3 = parseS3Path(s3Path);
+    if (!process.env.S3_REGION) {
+      const inferred = inferS3Region(parsedS3.bucket);
+      if (inferred) {
+        s3Region = inferred;
+      }
+    }
+  }
+
+  const s3Client = new S3Client({ region: s3Region });
+
+  if (s3Path) {
+    const keys = await listS3Images(s3Client, parsedS3.bucket, parsedS3.prefix);
     if (keys.length === 0) {
       return jsonResponse(400, { error: "No images found for S3 prefix." });
     }
     if (keys.length > MAX_FILES) {
       return jsonResponse(400, { error: `Too many S3 images. Max ${MAX_FILES}.` });
     }
-    s3Inputs = keys.map((key) => ({ bucket: parsed.bucket, key }));
+    s3Inputs = keys.map((key) => ({ bucket: parsedS3.bucket, key }));
   }
 
   await createJob({
