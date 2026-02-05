@@ -5,5 +5,9 @@ exports.beaverApi = defineFunction({
   name: "beaver-api",
   runtime: 18,
   entry: "./index.js",
-  depsLockFilePath: path.join(__dirname, "package-lock.json"),
+  depsLockFilePath: path.resolve(
+    __dirname,
+    "../../..",
+    "amplify/functions/beaver-api/package-lock.json",
+  ),
 });
