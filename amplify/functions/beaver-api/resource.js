@@ -6,10 +6,15 @@ exports.beaverApi = defineFunction({
   entry: "./handler.mjs",
   timeoutSeconds: 30,
   memoryMB: 1024,
-  layers: {
-    sharp: "arn:aws:lambda:us-east-2:727117753557:layer:sharp:1",
+  bundling: {
+    externalModules: [],
+    nodeModules: ["@aws-sdk/client-ssm"],
   },
-  depsLockFilePath: "package-lock.json",
+  layers: {
+    sharp: "arn:aws:lambda:us-east-2:727117753557:layer:sharp-linux-x64:3",
+    ssm: "arn:aws:lambda:us-east-2:727117753557:layer:aws-sdk-client-ssm:1",
+  },
+  depsLockFilePath: "amplify/functions/beaver-api/package-lock.json",
   environment: {
     BEAVER_BEDROCK_MODEL_ID: secret("BEAVER_BEDROCK_MODEL_ID"),
     BEAVER_ANIMAL_MODEL_ID: secret("BEAVER_ANIMAL_MODEL_ID"),
@@ -17,5 +22,6 @@ exports.beaverApi = defineFunction({
     BEAVER_JOB_BUCKET: secret("BEAVER_JOB_BUCKET"),
     BEAVER_DB_URL: secret("BEAVER_DB_URL"),
     BEAVER_DB_SSL: secret("BEAVER_DB_SSL"),
+    NODE_PATH: "/opt/nodejs/node_modules:/opt/nodejs/node18/node_modules:/opt/nodejs/nodejs/node_modules",
   },
 });
