@@ -1,3 +1,4 @@
+import "@aws-sdk/client-ssm";
 import * as cjsModule from "./index.cjs";
 
 const mod = cjsModule?.default ?? cjsModule;
