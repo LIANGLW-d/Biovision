@@ -6,7 +6,9 @@ exports.beaverApi = defineFunction({
   entry: "./handler.mjs",
   timeoutSeconds: 30,
   memoryMB: 1024,
-  layers: ["arn:aws:lambda:us-east-2:727117753557:layer:sharp:1"],
+  layers: {
+    sharp: "arn:aws:lambda:us-east-2:727117753557:layer:sharp:1",
+  },
   depsLockFilePath: "package-lock.json",
   environment: {
     BEAVER_BEDROCK_MODEL_ID: secret("BEAVER_BEDROCK_MODEL_ID"),
