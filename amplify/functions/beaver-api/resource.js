@@ -5,7 +5,7 @@ exports.beaverApi = defineFunction({
   runtime: 18,
   entry: "./handler.mjs",
   timeoutSeconds: 30,
-  memoryMB: 1024,
+  memoryMB: 2048,
   bundling: {
     externalModules: [],
     nodeModules: ["@aws-sdk/client-ssm"],
