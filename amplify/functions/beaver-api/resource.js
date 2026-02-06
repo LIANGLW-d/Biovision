@@ -3,10 +3,12 @@ const { defineFunction, secret } = require("@aws-amplify/backend");
 exports.beaverApi = defineFunction({
   name: "beaver-api",
   runtime: 18,
-  entry: "./index.js",
+  entry: "./handler.mjs",
+  timeoutSeconds: 30,
+  memoryMB: 1024,
+  layers: ["arn:aws:lambda:us-east-2:145266761615:layer:sharp:10"],
   depsLockFilePath: "package-lock.json",
   environment: {
-    AWS_REGION: secret("AWS_REGION"),
     BEAVER_BEDROCK_MODEL_ID: secret("BEAVER_BEDROCK_MODEL_ID"),
     BEAVER_ANIMAL_MODEL_ID: secret("BEAVER_ANIMAL_MODEL_ID"),
     BEAVER_CHAT_MODEL_ID: secret("BEAVER_CHAT_MODEL_ID"),
