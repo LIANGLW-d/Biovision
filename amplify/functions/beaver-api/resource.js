@@ -8,7 +8,7 @@ exports.beaverApi = defineFunction({
   memoryMB: 2048,
   bundling: {
     externalModules: [],
-    nodeModules: ["@aws-sdk/client-ssm"],
+    nodeModules: ["@aws-sdk/client-ssm", "@aws-sdk/client-sqs"],
   },
   layers: {
     sharp: "arn:aws:lambda:us-east-2:727117753557:layer:sharp-linux-x64:3",

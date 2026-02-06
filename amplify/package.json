@@ -2,7 +2,9 @@
   "name": "amplify-backend",
   "private": true,
   "dependencies": {
-    "@aws-amplify/backend": "^1.0.0"
+    "@aws-amplify/backend": "^1.0.0",
+    "aws-cdk-lib": "^2.192.0",
+    "constructs": "^10.4.2"
   },
   "devDependencies": {
     "@types/node": "^20.11.30"

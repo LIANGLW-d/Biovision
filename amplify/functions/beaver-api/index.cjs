@@ -10,6 +10,7 @@ const {
   GetObjectCommand,
   HeadBucketCommand,
 } = require("@aws-sdk/client-s3");
+const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { parse: parseCsv } = require("csv-parse/sync");
 const { createAmazonBedrock } = require("@ai-sdk/amazon-bedrock");
@@ -538,6 +539,7 @@ async function handleJobs(event) {
   }
 
   const s3Client = new S3Client({ region: s3Region });
+  const jobClient = new S3Client({ region });
 
   if (s3Path) {
     const keys = await listS3Images(s3Client, parsedS3.bucket, parsedS3.prefix);
@@ -548,6 +550,50 @@ async function handleJobs(event) {
       return jsonResponse(400, { error: `Too many S3 images. Max ${MAX_FILES}.` });
     }
     s3Inputs = keys.map((key) => ({ bucket: parsedS3.bucket, key }));
+  }
+
+  const queueUrl = process.env.BEAVER_JOB_QUEUE_URL;
+  if (queueUrl) {
+    const uploadedInputs = [];
+    if (uploadFiles.length > 0) {
+      for (const file of uploadFiles) {
+        const key = `jobs/${jobId}/input/${file.filename}`;
+        await jobClient.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: file.buffer,
+            ContentType: file.mimeType || "application/octet-stream",
+          }),
+        );
+        uploadedInputs.push({ bucket, key });
+      }
+    }
+    const allInputs = [...uploadedInputs, ...s3Inputs];
+    await createJob({
+      id: jobId,
+      source: s3Path ? "s3" : "upload",
+      totalImages: allInputs.length,
+    });
+    const sqsClient = new SQSClient({ region });
+    await sqsClient.send(
+      new SendMessageCommand({
+        QueueUrl: queueUrl,
+        MessageBody: JSON.stringify({
+          jobId,
+          modelId,
+          bucket,
+          region,
+          s3Region,
+          s3Inputs: allInputs,
+        }),
+      }),
+    );
+    return jsonResponse(202, {
+      job_id: jobId,
+      status: "queued",
+      total_images: allInputs.length,
+    });
   }
 
   await createJob({
@@ -767,6 +813,29 @@ function getLastUserText(messages) {
 }
 
 exports.handler = async (event) => {
+  if (Array.isArray(event?.Records) && event.Records[0]?.eventSource === "aws:sqs") {
+    for (const record of event.Records) {
+      try {
+        const payload = JSON.parse(record.body || "{}");
+        if (!payload.jobId || !payload.modelId || !payload.bucket || !payload.region) {
+          throw new Error("Invalid job payload.");
+        }
+        const s3Inputs = Array.isArray(payload.s3Inputs) ? payload.s3Inputs : [];
+        await processJob({
+          jobId: payload.jobId,
+          files: [],
+          s3Inputs,
+          modelId: payload.modelId,
+          bucket: payload.bucket,
+          region: payload.region,
+          s3Region: payload.s3Region || payload.region,
+        });
+      } catch (error) {
+        console.error("[jobs] queue processing error", error);
+      }
+    }
+    return { statusCode: 200, body: "" };
+  }
   if (event.requestContext?.http?.method === "OPTIONS" || event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: corsHeaders, body: "" };
   }
