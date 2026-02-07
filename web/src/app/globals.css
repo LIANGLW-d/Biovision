@@ -2,20 +2,57 @@
 
 :root {
   color-scheme: light;
-  --background: 30 20% 98%;
-  --foreground: 228 17% 12%;
+  /* Base */
+  --background: 210 20% 96%;
+  --foreground: 218 16% 14%;
   --card: 0 0% 100%;
-  --card-foreground: 228 17% 12%;
-  --muted: 30 16% 94%;
-  --muted-foreground: 223 8% 45%;
-  --border: 30 12% 88%;
-  --primary: 222 25% 14%;
-  --primary-foreground: 0 0% 98%;
-  --accent: 145 45% 38%;
-  --accent-foreground: 0 0% 98%;
+  --card-foreground: 218 16% 14%;
+  --muted: 169 27% 92%;
+  --muted-foreground: 219 10% 40%;
+  --border: 157 37% 79%;
+  --primary: 152 57% 44%;
+  --primary-foreground: 0 0% 100%;
+  --primary-hover: 159 53% 38%;
+
+  /* Soft states */
+  --soft-primary-bg: 164 30% 88%;
+  --soft-primary-border: 157 37% 79%;
+  --soft-destructive-bg: 358 44% 89%;
+  --soft-destructive-border: 356 59% 76%;
+
+  /* Gradient tokens */
+  --gradient-green-from: 153 56% 43%;
+  --gradient-green-to: 159 53% 38%;
+  --gradient-blue-from: 213 74% 54%;
+  --gradient-blue-to: 222 69% 51%;
+
+  /* Decorative background gradient */
+  --bg-decor-start: 169 27% 92%;
+  --bg-decor-end: 210 46% 91%;
+
+  /* Accent is used as the main CTA in some screens (e.g. "Run detection"). */
+  --accent: 152 57% 44%;
+  --accent-foreground: 0 0% 100%;
   --sidebar: 30 26% 96%;
   --sidebar-border: 30 14% 88%;
   --radius: 1rem;
+}
+
+/* Tailwind v4 CSS-first theme tokens (shadcn-friendly) */
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-border: hsl(var(--border));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-primary-hover: hsl(var(--primary-hover));
+
+  --color-soft-primary-bg: hsl(var(--soft-primary-bg));
+  --color-soft-primary-border: hsl(var(--soft-primary-border));
+  --color-soft-destructive-bg: hsl(var(--soft-destructive-bg));
+  --color-soft-destructive-border: hsl(var(--soft-destructive-border));
 }
 
 *,
@@ -27,8 +64,37 @@
 body {
   margin: 0;
   font-family: var(--font-geist), system-ui, -apple-system, sans-serif;
-  background: linear-gradient(135deg, #f7f4ee 0%, #ffffff 45%, #eef4f1 100%);
+  background: linear-gradient(
+    135deg,
+    hsl(var(--bg-decor-start)) 0%,
+    hsl(var(--background)) 45%,
+    hsl(var(--bg-decor-end)) 100%
+  );
   color: hsl(var(--foreground));
+}
+
+@layer utilities {
+  .text-gradient-green {
+    background-image: linear-gradient(
+      90deg,
+      hsl(var(--gradient-green-from)),
+      hsl(var(--gradient-green-to))
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .text-gradient-blue {
+    background-image: linear-gradient(
+      90deg,
+      hsl(var(--gradient-blue-from)),
+      hsl(var(--gradient-blue-to))
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
 }
 
 ::-webkit-scrollbar {

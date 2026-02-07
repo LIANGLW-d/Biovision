@@ -4,6 +4,82 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { postProcessAnimalOutput } from "@/lib/animalPostProcess";
 import { resolveBeaverApiBase } from "@/lib/beaverApiBase";
 
+function IconUpload(props: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={props.className}
+      aria-hidden="true"
+    >
+      <path d="M12 3v12" />
+      <path d="M7 8l5-5 5 5" />
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    </svg>
+  );
+}
+
+function IconFolder(props: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={props.className}
+      aria-hidden="true"
+    >
+      <path d="M3 7a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+    </svg>
+  );
+}
+
+function IconUser(props: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={props.className}
+      aria-hidden="true"
+    >
+      <path d="M20 21a8 8 0 0 0-16 0" />
+      <circle cx="12" cy="8" r="4" />
+    </svg>
+  );
+}
+
+function IconBot(props: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={props.className}
+      aria-hidden="true"
+    >
+      <path d="M12 4V2" />
+      <path d="M8 3h8" />
+      <rect x="4" y="7" width="16" height="12" rx="3" />
+      <path d="M9 12h.01" />
+      <path d="M15 12h.01" />
+      <path d="M10 16h4" />
+    </svg>
+  );
+}
+
 type DetectionResult = {
   id: string;
   image_path: string;
@@ -83,11 +159,51 @@ function buildCsv(rows: DetectionResult[]) {
   return lines.join("\n");
 }
 
+async function readErrorFromResponse(response: Response) {
+  const statusLine = `HTTP ${response.status} ${response.statusText || ""}`.trim();
+  const contentType = response.headers.get("content-type") || "";
+  const upstreamErrorType =
+    response.headers.get("x-amzn-errortype") ||
+    response.headers.get("x-amz-errortype") ||
+    "";
+
+  const text = await response.text().catch(() => "");
+  if (contentType.includes("application/json")) {
+    try {
+      const payload = JSON.parse(text) as Record<string, unknown>;
+      const message =
+        (typeof payload.error === "string" && payload.error) ||
+        (typeof payload.message === "string" && payload.message) ||
+        (typeof payload.Message === "string" && payload.Message) ||
+        "";
+      if (message) {
+        return upstreamErrorType
+          ? `${statusLine} (${upstreamErrorType}): ${message}`
+          : `${statusLine}: ${message}`;
+      }
+      if (text.trim()) {
+        return upstreamErrorType
+          ? `${statusLine} (${upstreamErrorType}): ${text}`
+          : `${statusLine}: ${text}`;
+      }
+    } catch {
+      // Fall back to raw text below.
+    }
+  }
+
+  if (text.trim()) {
+    return upstreamErrorType
+      ? `${statusLine} (${upstreamErrorType}): ${text}`
+      : `${statusLine}: ${text}`;
+  }
+  return upstreamErrorType ? `${statusLine} (${upstreamErrorType})` : statusLine;
+}
+
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "chat">("dashboard");
+  const [activeTab, setActiveTab] = useState<"home" | "dashboard" | "chat">("home");
   const [s3Path, setS3Path] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
-  const [folderFiles, setFolderFiles] = useState<File[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [isDragOver, setIsDragOver] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState("");
   const [results, setResults] = useState<DetectionResult[]>([]);
@@ -105,15 +221,16 @@ export default function Home() {
   const [csvName, setCsvName] = useState("");
   const [input, setInput] = useState("");
   const [expandedRows, setExpandedRows] = useState<string[]>([]);
-  const [showCsvPanel, setShowCsvPanel] = useState(true);
   const [chatMessages, setChatMessages] = useState<
     Array<{ id: string; role: "user" | "assistant"; text: string }>
   >([]);
   const [chatStatus, setChatStatus] = useState<"idle" | "loading">("idle");
   const [chatError, setChatError] = useState("");
 
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const csvFileRef = useRef<HTMLInputElement>(null);
+  const howItWorksRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const inputEl = folderInputRef.current;
@@ -122,6 +239,57 @@ export default function Home() {
       inputEl.setAttribute("directory", "");
     }
   }, []);
+
+  const getFilesFromDrop = async (dt: DataTransfer) => {
+    const items = Array.from(dt.items || []);
+    const hasEntries = items.some((it) => typeof (it as any).webkitGetAsEntry === "function");
+    if (!hasEntries) {
+      return Array.from(dt.files || []);
+    }
+
+    const readAllEntries = async (entry: any): Promise<File[]> => {
+      if (!entry) return [];
+      if (entry.isFile) {
+        const file = await new Promise<File>((resolve, reject) => {
+          entry.file(resolve, reject);
+        });
+        return [file];
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const out: File[] = [];
+        while (true) {
+          const batch = await new Promise<any[]>((resolve, reject) => {
+            reader.readEntries(resolve, reject);
+          });
+          if (!batch || batch.length === 0) break;
+          for (const child of batch) {
+            out.push(...(await readAllEntries(child)));
+          }
+        }
+        return out;
+      }
+      return [];
+    };
+
+    const files: File[] = [];
+    for (const item of items) {
+      const entry = (item as any).webkitGetAsEntry?.();
+      if (entry) {
+        files.push(...(await readAllEntries(entry)));
+      } else {
+        const f = item.getAsFile?.();
+        if (f) files.push(f);
+      }
+    }
+    return files;
+  };
+
+  const normalizeSelectedFiles = (files: File[]) => {
+    // Keep images only (folder drops can include non-images).
+    const images = files.filter((f) => /^image\//.test(f.type));
+    return images;
+  };
 
   const stats = useMemo(() => {
     let beavers = 0;
@@ -239,17 +407,18 @@ export default function Home() {
     try {
       const formData = new FormData();
       const s3 = s3Path.trim();
-      const allFiles = [...files, ...folderFiles];
+      const allFiles = [...selectedFiles];
       const isSingleS3File = Boolean(s3) && /\.(jpe?g|png|tiff?|webp)$/i.test(s3);
       const useClassifyApi =
         isSingleS3File || (!s3 && allFiles.length > 0 && allFiles.length <= 5);
       const useJobsApi = !useClassifyApi && (Boolean(s3) || (!s3 && allFiles.length > 5));
       const uploadIsLocal = !s3 && allFiles.length > 0;
       const directApiBase = resolveBeaverApiBase().value;
+      const forceDirectApi = process.env.NEXT_PUBLIC_FORCE_DIRECT_API === "1";
       const shouldUseDirectApi =
         uploadIsLocal &&
         typeof window !== "undefined" &&
-        window.location.hostname.endsWith("amplifyapp.com");
+        (forceDirectApi || window.location.hostname.endsWith("amplifyapp.com"));
       let directUsesJobs = false;
 
       if (shouldUseDirectApi) {
@@ -317,8 +486,7 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || "Detection failed.");
+        throw new Error(await readErrorFromResponse(response));
       }
 
       const payload = await response.json();
@@ -338,7 +506,10 @@ export default function Home() {
         while (attempts < maxAttempts) {
           await new Promise((resolve) => setTimeout(resolve, 2000));
           const jobResponse = await fetch(`/api/jobs/${nextJobId}`);
-          const jobPayload = await jobResponse.json();
+          if (!jobResponse.ok) {
+            throw new Error(await readErrorFromResponse(jobResponse));
+          }
+          const jobPayload = await jobResponse.json().catch(() => ({}));
           setJobStatus(jobPayload.status || "");
           setJobProgress({
             completed: jobPayload.completed_images || 0,
@@ -436,12 +607,12 @@ export default function Home() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: messageText.trim(), csvText, modelId }),
+        body: JSON.stringify({ message: messageText.trim(), csvText, csvPath, modelId }),
       });
-      const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(payload.error || "Chat request failed.");
+        throw new Error(await readErrorFromResponse(response));
       }
+      const payload = await response.json().catch(() => ({}));
       const assistantMessage = {
         id: `assistant_${Date.now()}`,
         role: "assistant" as const,
@@ -468,105 +639,504 @@ export default function Home() {
 
 
   return (
-    <div className="min-h-screen text-[hsl(var(--foreground))]">
-      <div className="flex min-h-screen">
-        <aside className="flex w-60 flex-col gap-6 border-r border-[hsl(var(--sidebar-border))] bg-[hsl(var(--sidebar))]/80 px-5 py-6 backdrop-blur">
+    <div className="relative min-h-screen text-[hsl(var(--foreground))]">
+      {activeTab === "home" && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(90%_70%_at_14%_10%,hsl(var(--soft-primary-bg)/0.85)_0%,transparent_56%),radial-gradient(90%_70%_at_86%_12%,hsl(var(--bg-decor-end)/0.9)_0%,transparent_58%),linear-gradient(135deg,hsl(var(--bg-decor-start)/0.55)_0%,hsl(var(--background))_45%,hsl(var(--bg-decor-end)/0.45)_100%)]"
+        />
+      )}
+      <header className="px-6 py-6">
+        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4">
           <div>
             <p className="text-[10px] font-semibold uppercase tracking-[0.35em] text-[hsl(var(--muted-foreground))]">
+              BIOVISION
+            </p>
+            <p className="mt-1 text-sm font-semibold text-[hsl(var(--foreground))]">
               DFW Beaver ID
             </p>
-            <h1 className="mt-2 text-lg font-semibold">Field Ops Console</h1>
           </div>
-          <nav className="flex flex-col gap-2 text-sm">
-            <button
-              type="button"
-              onClick={() => setActiveTab("dashboard")}
-              className={`rounded-[var(--radius)] px-3 py-2 text-left font-medium transition ${
-                activeTab === "dashboard"
-                  ? "bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] shadow-sm"
-                  : "hover:bg-white/70"
-              }`}
-            >
-              Workflow
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab("chat")}
-              className={`rounded-[var(--radius)] px-3 py-2 text-left font-medium transition ${
-                activeTab === "chat"
-                  ? "bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] shadow-sm"
-                  : "hover:bg-white/70"
-              }`}
-            >
-              Chat
-            </button>
-          </nav>
-          <div className="mt-auto rounded-2xl border border-[hsl(var(--border))] bg-white/80 p-3 text-xs text-[hsl(var(--muted-foreground))] shadow-sm">
-            Local runner
-            <p className="mt-1 text-[11px]">
-              Uses `/api/classify` ({"<=5"} images) or `/api/jobs` (batch) + Bedrock chat.
-            </p>
-          </div>
-        </aside>
 
-        <main className="flex-1 px-6 py-8">
-          <div className="mx-auto flex w-full max-w-6xl flex-col">
-            <header className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <h2 className="text-2xl font-semibold">
-                {activeTab === "dashboard" ? "Detection Workflow" : "Chat"}
-              </h2>
-              <p className="mt-2 max-w-2xl text-sm text-[hsl(var(--muted-foreground))]">
-                Upload trail-cam batches, run Beaver + Animal ID, review labels, export CSVs, and
-                ask questions against the results.
-              </p>
-            </div>
-            <div className="rounded-full border border-[hsl(var(--border))] bg-white/80 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))] shadow-sm">
-              Vercel-style UI
-            </div>
-          </header>
+	          <nav className="flex items-center gap-2 text-sm">
+	            <button
+	              type="button"
+	              onClick={() => setActiveTab("home")}
+	              className={`rounded px-2 py-1 text-sm font-medium transition ${
+	                activeTab === "home"
+	                  ? "border-b-2 border-[hsl(var(--foreground))] text-[hsl(var(--foreground))]"
+	                  : "border-b-2 border-transparent text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
+	              }`}
+	            >
+	              Home
+	            </button>
+	            <button
+	              type="button"
+	              onClick={() => setActiveTab("dashboard")}
+	              className={`rounded px-2 py-1 text-sm font-medium transition ${
+	                activeTab === "dashboard"
+	                  ? "border-b-2 border-[hsl(var(--foreground))] text-[hsl(var(--foreground))]"
+	                  : "border-b-2 border-transparent text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
+	              }`}
+	            >
+	              Workflow
+	            </button>
+	            <button
+	              type="button"
+	              onClick={() => setActiveTab("chat")}
+	              className={`rounded px-2 py-1 text-sm font-medium transition ${
+	                activeTab === "chat"
+	                  ? "border-b-2 border-[hsl(var(--foreground))] text-[hsl(var(--foreground))]"
+	                  : "border-b-2 border-transparent text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
+	              }`}
+	            >
+	              Chat
+	            </button>
+	          </nav>
+        </div>
+      </header>
 
-            {activeTab === "dashboard" ? (
+      <main
+        className={`relative px-6 pb-8 ${
+          activeTab === "home" ? "bg-transparent" : ""
+        }`}
+      >
+        <div className="mx-auto flex w-full max-w-6xl flex-col">
+            {activeTab !== "home" && (
+              <header className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-2xl font-semibold">
+                    {activeTab === "dashboard" ? "Detection Workflow" : "Chat"}
+                  </h2>
+                  <p className="mt-2 max-w-2xl text-sm text-[hsl(var(--muted-foreground))]">
+                    Upload trail-cam batches, run Beaver + Animal ID, review labels, export CSVs,
+                    and ask questions against the results.
+                  </p>
+                </div>
+              </header>
+            )}
+
+            {activeTab === "home" ? (
+              <>
+                <section className="relative mt-6 flex min-h-[78vh] items-center justify-center overflow-hidden">
+                  <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center px-4 text-center">
+                    <div className="inline-flex items-center gap-2 rounded-full border border-[hsl(var(--soft-primary-border))] bg-[hsl(var(--soft-primary-bg))]/70 px-4 py-2 text-sm font-semibold text-[hsl(var(--primary))] shadow-sm">
+                      <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/70">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-4 w-4"
+                          aria-hidden="true"
+                        >
+                          <path d="M12 2l1.2 3.6L17 7l-3.8 1.4L12 12l-1.2-3.6L7 7l3.8-1.4L12 2z" />
+                          <path d="M19 11l.7 2.1L22 14l-2.3.9L19 17l-.7-2.1L16 14l2.3-.9L19 11z" />
+                        </svg>
+                      </span>
+                      AI-Powered Wildlife Detection
+                    </div>
+
+                    <h1 className="mt-8 text-5xl font-semibold tracking-tight sm:text-6xl">
+                      <span className="text-[hsl(var(--foreground))]">DFW </span>
+                      <span className="bg-gradient-to-r from-[hsl(var(--gradient-green-from))] to-[hsl(var(--gradient-green-to))] bg-clip-text text-transparent">
+                        Beaver ID
+                      </span>
+                    </h1>
+
+                    <p className="mt-6 max-w-3xl text-xl leading-relaxed text-[hsl(var(--muted-foreground))]">
+                      Review trail-camera batches faster with{" "}
+                      <span className="font-semibold text-[hsl(var(--foreground))]">
+                        AI detection
+                      </span>{" "}
+                      + human correction
+                    </p>
+
+                    <div className="mt-10 flex flex-wrap items-center justify-center gap-x-8 gap-y-4">
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("dashboard")}
+                        className="inline-flex items-center gap-3 rounded-full bg-[hsl(var(--accent))] px-8 py-4 text-base font-semibold text-[hsl(var(--accent-foreground))] shadow-lg shadow-black/10 transition hover:bg-[hsl(var(--primary-hover))]"
+                      >
+                        Start Detection
+                        <span aria-hidden="true">→</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          howItWorksRef.current?.scrollIntoView({
+                            behavior: "smooth",
+                            block: "start",
+                          });
+                        }}
+                        className="text-base font-semibold text-[hsl(var(--muted-foreground))] transition hover:text-[hsl(var(--foreground))]"
+                      >
+                        See how it works
+                      </button>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="mt-24">
+                  <div className="text-center">
+                    <h2 className="text-4xl font-semibold tracking-tight text-[hsl(var(--foreground))]">
+                      Core{" "}
+                      <span className="text-[hsl(var(--primary))]">Highlights</span>
+                    </h2>
+                    <p className="mt-4 text-lg text-[hsl(var(--muted-foreground))]">
+                      Everything you need to process and analyze trail camera data efficiently
+                    </p>
+                  </div>
+
+                  <div className="mt-12 grid gap-6 lg:grid-cols-2">
+                    <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/70 p-8 shadow-lg shadow-black/5">
+                      <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[hsl(var(--soft-primary-bg))] text-[hsl(var(--primary))]">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M4 7h4l2-2h4l2 2h4" />
+                          <rect x="4" y="7" width="16" height="13" rx="3" />
+                          <path d="M12 10a4 4 0 1 0 0.001 0z" />
+                        </svg>
+                      </div>
+                      <h3 className="mt-6 text-2xl font-semibold">Beaver Detection</h3>
+                      <p className="mt-3 text-base leading-relaxed text-[hsl(var(--muted-foreground))]">
+                        Advanced ML model trained specifically for beaver identification in trail
+                        camera footage.
+                      </p>
+                    </div>
+
+                    <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/70 p-8 shadow-lg shadow-black/5">
+                      <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[hsl(var(--bg-decor-end))] text-[hsl(var(--gradient-blue-to))]">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M7 5c1.5 0 2.5 1 2.5 2.5S8.5 10 7 10" />
+                          <path d="M17 5c-1.5 0-2.5 1-2.5 2.5S15.5 10 17 10" />
+                          <path d="M7 10c0 5 5 5 5 9" />
+                          <path d="M17 10c0 5-5 5-5 9" />
+                          <path d="M8 21h8" />
+                        </svg>
+                      </div>
+                      <h3 className="mt-6 text-2xl font-semibold">Other Animal Detection</h3>
+                      <p className="mt-3 text-base leading-relaxed text-[hsl(var(--muted-foreground))]">
+                        Automatically classify other wildlife species captured in your images.
+                      </p>
+                    </div>
+
+                    <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/70 p-8 shadow-lg shadow-black/5">
+                      <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[hsl(var(--soft-primary-bg))] text-[hsl(var(--primary))]">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                          <circle cx="9" cy="7" r="4" />
+                          <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+                          <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                        </svg>
+                      </div>
+                      <h3 className="mt-6 text-2xl font-semibold">Human Label Grouping</h3>
+                      <p className="mt-3 text-base leading-relaxed text-[hsl(var(--muted-foreground))]">
+                        Manual correction tools for biologists to refine and validate predictions.
+                      </p>
+                    </div>
+
+                    <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/70 p-8 shadow-lg shadow-black/5">
+                      <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[hsl(var(--bg-decor-end))] text-[hsl(var(--gradient-blue-to))]">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+                        </svg>
+                      </div>
+                      <h3 className="mt-6 text-2xl font-semibold">AI Chatbot</h3>
+                      <p className="mt-3 text-base leading-relaxed text-[hsl(var(--muted-foreground))]">
+                        Ask questions about your results for fast counting and summaries.
+                      </p>
+                    </div>
+                  </div>
+                </section>
+
+                <section ref={howItWorksRef} className="mt-28 pb-16">
+                  <div className="text-center">
+                    <h2 className="text-4xl font-semibold tracking-tight text-[hsl(var(--foreground))]">
+                      How It{" "}
+                      <span className="bg-gradient-to-r from-[hsl(var(--gradient-blue-from))] to-[hsl(var(--gradient-blue-to))] bg-clip-text text-transparent">
+                        Works
+                      </span>
+                    </h2>
+                    <p className="mt-4 text-lg text-[hsl(var(--muted-foreground))]">
+                      From upload to insights in five simple steps
+                    </p>
+                  </div>
+
+                  <div className="mt-14 grid gap-10 sm:grid-cols-2 lg:grid-cols-3">
+                    <div className="text-center">
+                      <div className="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-[hsl(var(--border))] bg-white/70 shadow-sm">
+                        <span className="absolute -right-1 -top-1 h-4 w-4 rounded-full bg-[hsl(var(--primary))]" />
+                        <IconUpload className="h-6 w-6" />
+                      </div>
+                      <p className="mt-5 text-lg font-semibold">Upload</p>
+                      <p className="mt-2 text-sm text-[hsl(var(--muted-foreground))]">
+                        Upload images or ZIP files
+                      </p>
+                    </div>
+
+                    <div className="text-center">
+                      <div className="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-[hsl(var(--border))] bg-white/70 shadow-sm">
+                        <span className="absolute -right-1 -top-1 h-4 w-4 rounded-full bg-[hsl(var(--primary))]" />
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <polygon points="9,7 19,12 9,17" />
+                        </svg>
+                      </div>
+                      <p className="mt-5 text-lg font-semibold">Run Detection</p>
+                      <p className="mt-2 text-sm text-[hsl(var(--muted-foreground))]">
+                        AI processes your batch
+                      </p>
+                    </div>
+
+                    <div className="text-center">
+                      <div className="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-[hsl(var(--border))] bg-white/70 shadow-sm">
+                        <span className="absolute -right-1 -top-1 h-4 w-4 rounded-full bg-[hsl(var(--primary))]" />
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M12 20h9" />
+                          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                        </svg>
+                      </div>
+                      <p className="mt-5 text-lg font-semibold">Review & Correct</p>
+                      <p className="mt-2 text-sm text-[hsl(var(--muted-foreground))]">
+                        Validate and fix labels
+                      </p>
+                    </div>
+
+                    <div className="text-center lg:col-start-1 lg:col-end-2 lg:justify-self-center">
+                      <div className="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-[hsl(var(--border))] bg-white/70 shadow-sm">
+                        <span className="absolute -right-1 -top-1 h-4 w-4 rounded-full bg-[hsl(var(--primary))]" />
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M12 3v12" />
+                          <path d="M7 10l5 5 5-5" />
+                          <path d="M21 21H3" />
+                        </svg>
+                      </div>
+                      <p className="mt-5 text-lg font-semibold">Export CSV</p>
+                      <p className="mt-2 text-sm text-[hsl(var(--muted-foreground))]">
+                        Download your results
+                      </p>
+                    </div>
+
+                    <div className="text-center lg:col-start-2 lg:col-end-3 lg:justify-self-center">
+                      <div className="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-[hsl(var(--border))] bg-white/70 shadow-sm">
+                        <span className="absolute -right-1 -top-1 h-4 w-4 rounded-full bg-[hsl(var(--primary))]" />
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-6 w-6"
+                          aria-hidden="true"
+                        >
+                          <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+                        </svg>
+                      </div>
+                      <p className="mt-5 text-lg font-semibold">Ask Chatbot</p>
+                      <p className="mt-2 text-sm text-[hsl(var(--muted-foreground))]">
+                        Get instant insights
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-16 border-t border-[hsl(var(--border))] pt-10 text-center text-sm text-[hsl(var(--muted-foreground))]">
+                    © 2026 DFW Beaver ID. Built for wildlife biologists.
+                  </div>
+                </section>
+              </>
+            ) : activeTab === "dashboard" ? (
               <section className="mt-8 grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-              <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/90 p-6 shadow-lg shadow-black/5">
+              <div className="flex h-full flex-col rounded-3xl border border-[hsl(var(--border))] bg-white/90 p-6 shadow-lg shadow-black/5">
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
                   Input
                 </h3>
-                <div className="mt-4 grid gap-4 text-sm">
+                <div className="mt-4 flex flex-1 flex-col gap-3 text-sm">
                   <div>
                     <label className="text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
                       Upload images
                     </label>
-                    <input
-                      type="file"
-                      accept="image/*"
-                      multiple
-                      onChange={(event) => {
-                        setFiles(Array.from(event.target.files || []));
+                    <div
+                      onDragEnter={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setIsDragOver(true);
                       }}
-                      className="mt-2 block w-full rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-xs shadow-sm"
-                    />
-                    <p className="mt-1 text-xs text-[hsl(var(--muted-foreground))]">
-                      {files.length} image(s) selected.
-                    </p>
-                  </div>
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setIsDragOver(true);
+                      }}
+                      onDragLeave={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setIsDragOver(false);
+                      }}
+                      onDrop={async (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setIsDragOver(false);
+                        const dropped = await getFilesFromDrop(e.dataTransfer);
+                        const next = normalizeSelectedFiles(dropped);
+                        setSelectedFiles(next);
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          fileInputRef.current?.click();
+                        }
+                      }}
+                      className={`mt-2 min-h-[164px] rounded-3xl border-2 border-dashed px-6 py-6 text-center shadow-sm transition ${
+                        isDragOver
+                          ? "border-[hsl(var(--primary))] bg-[hsl(var(--soft-primary-bg))]/60"
+                          : "border-[hsl(var(--border))] bg-white/60 hover:bg-white/80"
+                      }`}
+                    >
+                      <div className="mx-auto flex max-w-xl flex-col items-center gap-4">
+                        <div>
+                          <p className="text-sm font-semibold text-[hsl(var(--foreground))]">
+                            Drop images here
+                          </p>
+                          <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+                            or click to browse your files
+                          </p>
+                        </div>
 
-                  <div>
-                    <label className="text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-                      Upload folder
-                    </label>
-                    <input
-                      ref={folderInputRef}
-                      type="file"
-                      multiple
-                      onChange={(event) => {
-                        setFolderFiles(Array.from(event.target.files || []));
-                      }}
-                      className="mt-2 block w-full rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-xs shadow-sm"
-                    />
-                    <p className="mt-1 text-xs text-[hsl(var(--muted-foreground))]">
-                      {folderFiles.length} file(s) from folder.
-                    </p>
+                        <div className="flex flex-wrap items-center justify-center gap-2">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              fileInputRef.current?.click();
+                            }}
+                            className="inline-flex items-center gap-2 rounded-2xl border border-[hsl(var(--border))] bg-white px-4 py-2 text-xs font-semibold shadow-sm"
+                          >
+                            <IconUpload className="h-4 w-4" />
+                            Browse files
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              folderInputRef.current?.click();
+                            }}
+                            className="inline-flex items-center gap-2 rounded-2xl border border-[hsl(var(--border))] bg-white px-4 py-2 text-xs font-semibold shadow-sm"
+                          >
+                            <IconFolder className="h-4 w-4" />
+                            Browse folder
+                          </button>
+                          {selectedFiles.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedFiles([]);
+                              }}
+                              className="inline-flex items-center gap-2 rounded-2xl border border-[hsl(var(--soft-primary-border))] bg-[hsl(var(--soft-primary-bg))] px-4 py-2 text-xs font-semibold text-[hsl(var(--foreground))] shadow-sm"
+                            >
+                              Clear ({selectedFiles.length})
+                            </button>
+                          )}
+                        </div>
+
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          className="hidden"
+                          onChange={(event) => {
+                            const next = normalizeSelectedFiles(
+                              Array.from(event.target.files || []),
+                            );
+                            setSelectedFiles(next);
+                          }}
+                        />
+                        <input
+                          ref={folderInputRef}
+                          type="file"
+                          multiple
+                          className="hidden"
+                          onChange={(event) => {
+                            const next = normalizeSelectedFiles(
+                              Array.from(event.target.files || []),
+                            );
+                            setSelectedFiles(next);
+                          }}
+                        />
+
+                        {selectedFiles.length > 0 && (
+                          <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                            {selectedFiles.length} image(s) selected.
+                          </p>
+                        )}
+                      </div>
+                    </div>
                   </div>
 
                   <div>
@@ -587,245 +1157,216 @@ export default function Home() {
                     </p>
                   )}
 
-                  <button
-                    type="button"
-                    onClick={handleRunDetection}
-                    disabled={isRunning}
-                    className="rounded-2xl bg-[hsl(var(--accent))] px-4 py-3 text-sm font-semibold text-[hsl(var(--accent-foreground))] shadow-md shadow-black/10 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {isRunning ? "Running detection..." : "Run detection"}
-                  </button>
-                  {jobStatus && (
-                    <div className="space-y-2 text-xs text-[hsl(var(--muted-foreground))]">
-                      <p>
-                        Job status: <span className="font-semibold">{jobStatus}</span>
+                  <div className="mt-auto space-y-3">
+                    <button
+                      type="button"
+                      onClick={handleRunDetection}
+                      disabled={isRunning}
+                      className="w-full rounded-2xl bg-[hsl(var(--accent))] px-4 py-3 text-sm font-semibold text-[hsl(var(--accent-foreground))] shadow-md shadow-black/10 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {isRunning ? "Running detection..." : "Run detection"}
+                    </button>
+                    {jobStatus && (
+                      <div className="space-y-2 text-xs text-[hsl(var(--muted-foreground))]">
+                        <p>
+                          Job status: <span className="font-semibold">{jobStatus}</span>
+                          {jobProgress.total > 0 && (
+                            <span className="ml-2">
+                              {jobProgress.completed}/{jobProgress.total}
+                            </span>
+                          )}
+                        </p>
                         {jobProgress.total > 0 && (
-                          <span className="ml-2">
-                            {jobProgress.completed}/{jobProgress.total}
-                          </span>
-                        )}
-                      </p>
-                      {jobProgress.total > 0 && (
-                        <div>
-                          <div className="h-2 w-full overflow-hidden rounded-full bg-[hsl(var(--border))]">
-                            <div
-                              className="h-full rounded-full bg-[hsl(var(--accent))] transition-all"
-                              style={{
-                                width: `${Math.min(
-                                  100,
-                                  Math.round(
-                                    (jobProgress.completed / jobProgress.total) * 100,
-                                  ),
-                                )}%`,
-                              }}
-                            />
+                          <div>
+                            <div className="h-2 w-full overflow-hidden rounded-full bg-[hsl(var(--border))]">
+                              <div
+                                className="h-full rounded-full bg-[hsl(var(--accent))] transition-all"
+                                style={{
+                                  width: `${Math.min(
+                                    100,
+                                    Math.round(
+                                      (jobProgress.completed / jobProgress.total) * 100,
+                                    ),
+                                  )}%`,
+                                }}
+                              />
+                            </div>
+                            <p className="mt-1 text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
+                              {Math.min(
+                                100,
+                                Math.round(
+                                  (jobProgress.completed / jobProgress.total) * 100,
+                                ),
+                              )}
+                              % complete
+                            </p>
                           </div>
-                          <p className="mt-1 text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-                            {Math.min(
-                              100,
-                              Math.round(
-                                (jobProgress.completed / jobProgress.total) * 100,
-                              ),
-                            )}
-                            % complete
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
-              <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/90 p-6 shadow-lg shadow-black/5">
+              <div className="flex h-full flex-col rounded-3xl border border-[hsl(var(--border))] bg-white/90 p-6 shadow-lg shadow-black/5">
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
                   Summary
                 </h3>
-                <div className="mt-4 grid gap-3 text-sm">
-                  <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))] p-4">
-                    <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Total images</p>
-                    <p className="text-2xl font-semibold">{stats.total}</p>
+                <div className="mt-4 flex flex-1 flex-col">
+                  <div className="grid gap-3 text-sm">
+                    <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))] p-4">
+                      <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Total images</p>
+                      <p className="text-2xl font-semibold">{stats.total}</p>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
+                        <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Animals</p>
+                        <p className="text-xl font-semibold">
+                          {stats.beavers + stats.otherAnimals}
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
+                        <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Beavers</p>
+                        <p className="text-xl font-semibold">{stats.beavers}</p>
+                      </div>
+                      <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
+                        <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Other animals</p>
+                        <p className="text-xl font-semibold">{stats.otherAnimals}</p>
+                      </div>
+                      <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
+                        <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">No animal</p>
+                        <p className="text-xl font-semibold">{stats.noAnimals}</p>
+                      </div>
+                    </div>
                   </div>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
-                      <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Animals</p>
-                      <p className="text-xl font-semibold">
-                        {stats.beavers + stats.otherAnimals}
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
-                      <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Beavers</p>
-                      <p className="text-xl font-semibold">{stats.beavers}</p>
-                    </div>
-                    <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
-                      <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Other animals</p>
-                      <p className="text-xl font-semibold">{stats.otherAnimals}</p>
-                    </div>
-                    <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
-                      <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">No animal</p>
-                      <p className="text-xl font-semibold">{stats.noAnimals}</p>
-                    </div>
+
+                  <div className="mt-auto">
+                    <button
+                      type="button"
+                      onClick={handleDownloadCsv}
+                      disabled={!resultsCsv}
+                      className="mt-6 w-full rounded-2xl border border-[hsl(var(--border))] bg-white px-4 py-3 text-sm font-semibold shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Download reviewed CSV
+                    </button>
+                    {jobCsvKey && (
+                      <button
+                        type="button"
+                        onClick={handleDownloadJobCsv}
+                        className="mt-3 w-full rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))] px-4 py-3 text-sm font-semibold shadow-sm"
+                      >
+                        Download job CSV
+                      </button>
+                    )}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleDownloadCsv}
-                  disabled={!resultsCsv}
-                  className="mt-6 w-full rounded-2xl border border-[hsl(var(--border))] bg-white px-4 py-3 text-sm font-semibold shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Download reviewed CSV
-                </button>
-                {jobCsvKey && (
-                  <button
-                    type="button"
-                    onClick={handleDownloadJobCsv}
-                    className="mt-3 w-full rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))] px-4 py-3 text-sm font-semibold shadow-sm"
-                  >
-                    Download job CSV
-                  </button>
-                )}
               </div>
             </section>
             ) : (
-              <section className="mt-8 grid gap-4">
-                <div className="rounded-3xl border border-[hsl(var(--border))] bg-white/90 shadow-lg shadow-black/5">
-                  <button
-                    type="button"
-                    onClick={() => setShowCsvPanel((prev) => !prev)}
-                    className="flex w-full items-center justify-between px-6 py-4 text-left text-sm font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]"
-                  >
-                    CSV Inputs
-                    <span className="text-xs normal-case text-[hsl(var(--muted-foreground))]">
-                      {showCsvPanel ? "Hide" : "Show"}
-                    </span>
-                  </button>
-                  {showCsvPanel && (
-                    <div className="border-t border-[hsl(var(--border))] px-6 py-4">
-                      <div className="grid gap-4 lg:grid-cols-[1fr_0.7fr]">
-                        <div className="grid gap-3 text-sm">
-                          <div>
-                            <label className="text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-                              CSV path (server)
-                            </label>
-                            <input
-                              value={csvPath}
-                              onChange={(event) => setCsvPath(event.target.value)}
-                              placeholder="/path/to/beaver_results.csv"
-                              className="mt-2 w-full rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black/10"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-                              Bedrock model ID (optional)
-                            </label>
-                            <input
-                              value={modelId}
-                              onChange={(event) => setModelId(event.target.value)}
-                              placeholder="arn:aws:bedrock:us-east-2:..."
-                              className="mt-2 w-full rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black/10"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-                              Upload CSV
-                            </label>
-                            <div className="mt-2 flex items-center gap-3">
-                              <button
-                                type="button"
-                                onClick={() => csvFileRef.current?.click()}
-                                className="rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-xs font-semibold shadow-sm"
-                              >
-                                Choose file
-                              </button>
-                              <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                                {csvName || "No file selected"}
-                              </span>
-                            </div>
-                            <input
-                              ref={csvFileRef}
-                              type="file"
-                              accept=".csv"
-                              className="hidden"
-                              onChange={(event) => {
-                                const file = event.target.files?.[0];
-                                if (!file) {
-                                  setCsvText("");
-                                  setCsvName("");
-                                  return;
-                                }
-                                setCsvName(file.name);
-                                const reader = new FileReader();
-                                reader.onload = () => {
-                                  setCsvText(String(reader.result || ""));
-                                };
-                                reader.readAsText(file);
-                              }}
-                            />
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={() => setCsvText(resultsCsv)}
-                              disabled={!resultsCsv}
-                              className="rounded-2xl bg-[hsl(var(--accent))] px-3 py-2 text-xs font-semibold text-[hsl(var(--accent-foreground))] shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                              Use latest results
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setCsvText("");
-                                setCsvPath("");
-                                setCsvName("");
-                              }}
-                              className="rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-xs font-semibold shadow-sm"
-                            >
-                              Clear CSV
-                            </button>
-                          </div>
-                        </div>
+              <section className="mt-8">
+                <div className="flex min-h-[72vh] flex-col rounded-3xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[hsl(var(--border))] px-6 py-4">
+                    <div className="flex items-center gap-3">
+                      <h3 className="text-sm font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
+                        Chat
+                      </h3>
+                      {isTyping && (
+                        <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                          Thinking...
+                        </span>
+                      )}
+                    </div>
 
-                        <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))] p-4 text-xs text-[hsl(var(--muted-foreground))]">
-                          <p className="font-semibold text-[hsl(var(--foreground))]">CSV status</p>
-                          <p className="mt-2">
-                            {csvText
-                              ? `CSV text loaded (${csvText.length} chars).`
-                              : "No CSV text loaded yet."}
-                          </p>
-                        </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
+                          CSV path
+                        </span>
+                        <input
+                          value={csvPath}
+                          onChange={(event) => setCsvPath(event.target.value)}
+                          placeholder="/path/to/results.csv"
+                          className="w-[240px] rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-xs shadow-sm focus:outline-none focus:ring-2 focus:ring-black/10"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => csvFileRef.current?.click()}
+                          className="rounded-2xl border border-[hsl(var(--border))] bg-white px-3 py-2 text-xs font-semibold shadow-sm"
+                        >
+                          Upload CSV
+                        </button>
+                        <span className="max-w-[220px] truncate text-xs text-[hsl(var(--muted-foreground))]">
+                          {csvName || "No file selected"}
+                        </span>
+                        <input
+                          ref={csvFileRef}
+                          type="file"
+                          accept=".csv"
+                          className="hidden"
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (!file) {
+                              setCsvText("");
+                              setCsvName("");
+                              return;
+                            }
+                            setCsvName(file.name);
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              setCsvText(String(reader.result || ""));
+                            };
+                            reader.readAsText(file);
+                          }}
+                        />
                       </div>
                     </div>
-                  )}
-                </div>
-
-                <div className="rounded-3xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-sm">
-                  <div className="flex items-center justify-between px-6 py-4">
-                    <h3 className="text-sm font-semibold uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-                      Chat
-                    </h3>
-                    {isTyping && (
-                      <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                        Thinking...
-                      </span>
-                    )}
                   </div>
 
-                  <div className="max-h-[55vh] overflow-y-auto px-6 pb-24">
-                    <div className="flex flex-col gap-3">
+                  <div className="flex-1 overflow-y-auto px-6 pb-24">
+                    <div className="flex flex-col gap-5 py-6">
                       {displayMessages.length === 0 && (
-                        <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                          Ask: “How many beavers are detected?” or “List animals found.”
-                        </p>
+                        <div className="mx-auto max-w-xl rounded-3xl border border-[hsl(var(--border))] bg-white/70 p-5 text-center shadow-sm">
+                          <p className="text-sm font-semibold text-[hsl(var(--foreground))]">
+                            AI Chat
+                          </p>
+                          <p className="mt-2 text-sm text-[hsl(var(--muted-foreground))]">
+                            Ask: “How many beavers are detected?” or “List animals found.”
+                          </p>
+                        </div>
                       )}
                       {displayMessages.map((message) => (
                         <div
                           key={message.id}
-                          className={`rounded-2xl px-4 py-3 text-sm ${
+                          className={
                             message.role === "user"
-                              ? "ml-auto bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]"
-                              : "bg-[hsl(var(--muted))] text-[hsl(var(--foreground))]"
-                          }`}
+                              ? "flex items-start justify-end gap-3"
+                              : "flex items-start justify-start gap-3"
+                          }
                         >
-                          {message.text}
+                          {message.role === "assistant" && (
+                            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-[hsl(var(--border))] bg-white/80 text-[hsl(var(--gradient-blue-to))] shadow-sm">
+                              <IconBot className="h-5 w-5" />
+                            </div>
+                          )}
+
+                          <div
+                            className={
+                              message.role === "user"
+                                ? "max-w-[min(720px,75%)] rounded-full bg-[hsl(var(--primary))] px-6 py-4 text-[15px] leading-relaxed text-[hsl(var(--primary-foreground))] shadow-md shadow-black/10"
+                                : "max-w-[min(760px,78%)] rounded-3xl border border-[hsl(var(--border))] bg-white/85 px-6 py-5 text-[15px] leading-relaxed text-[hsl(var(--foreground))] shadow-sm"
+                            }
+                          >
+                            {message.text}
+                          </div>
+
+                          {message.role === "user" && (
+                            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-[hsl(var(--soft-primary-border))] bg-[hsl(var(--soft-primary-bg))] text-[hsl(var(--primary))] shadow-sm">
+                              <IconUser className="h-5 w-5" />
+                            </div>
+                          )}
                         </div>
                       ))}
                       {chatError && (
@@ -1039,9 +1580,8 @@ export default function Home() {
               )}
             </section>
             )}
-          </div>
-        </main>
-      </div>
+        </div>
+      </main>
     </div>
   );
 }
