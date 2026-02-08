@@ -2,16 +2,12 @@ import argparse
 import csv
 import io
 import json
-import math
 import os
 import pathlib
 import random
 import re
-import string
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Iterable
 from urllib.parse import urlparse
 
@@ -492,246 +488,11 @@ def write_csv(rows: Iterable[dict], output_path: pathlib.Path) -> None:
         "exif_location",
         "error",
     ]
-    # Optional sequence aggregation fields (only emitted when present on rows).
-    sequence_fieldnames = [
-        "sequence_id",
-        "sequence_size",
-        "sequence_presence",
-        "sequence_species",
-        "sequence_species_score",
-        "sequence_disagreement",
-        "sequence_flag_manual_review",
-        "sequence_reason",
-        "sequence_group_key",
-        "sequence_start_ts",
-    ]
-    if any(
-        any(key in row for key in ("sequence_id", "sequence_presence", "sequence_species"))
-        for row in rows
-    ):
-        fieldnames.extend(sequence_fieldnames)
-
     with output_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-
-
-def _parse_exif_datetime(value: str) -> datetime | None:
-    raw = (value or "").strip()
-    if not raw:
-        return None
-    # Typical EXIF: "YYYY:MM:DD HH:MM:SS"
-    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
-        try:
-            return datetime.strptime(raw, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _parse_float(value) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        num = float(value)
-    else:
-        text = str(value).strip()
-        if not text:
-            return None
-        try:
-            num = float(text)
-        except ValueError:
-            return None
-    if math.isnan(num) or math.isinf(num):
-        return None
-    return num
-
-
-def _slug(value: str, max_len: int = 48) -> str:
-    allowed = set(string.ascii_letters + string.digits + "-_")
-    cleaned = "".join(ch if ch in allowed else "_" for ch in (value or ""))
-    cleaned = cleaned.strip("_")
-    if not cleaned:
-        return "unknown"
-    return cleaned[:max_len]
-
-
-@dataclass(frozen=True)
-class _ImageVote:
-    has_animal: bool
-    species: str
-    confidence: float
-
-
-def _effective_vote(row: dict) -> _ImageVote | None:
-    """
-    Converts a single image row into a (has_animal, species, confidence) vote.
-
-    We prefer beaver classifier if it fired; otherwise we use the animal detector output.
-    """
-    if row.get("has_beaver") is True:
-        conf = _parse_float(row.get("confidence")) or 0.0
-        return _ImageVote(has_animal=True, species="beaver", confidence=conf)
-
-    has_animal = row.get("has_animal", "")
-    if has_animal is True:
-        species = str(row.get("animal_type") or row.get("animal_group") or "animal").strip()
-        conf = _parse_float(row.get("animal_confidence")) or 0.0
-        return _ImageVote(has_animal=True, species=species, confidence=conf)
-    if has_animal is False:
-        return _ImageVote(has_animal=False, species="none", confidence=0.0)
-
-    return None
-
-
-def apply_sequence_aggregation(
-    rows: list[dict],
-    *,
-    gap_seconds: int = 6,
-    low_conf: float = 0.6,
-    high_conf: float = 0.8,
-    species_margin: float = 0.25,
-) -> None:
-    """
-    Adds sequence_* fields to each row in-place.
-
-    Group key:
-    - overlay_location (site id) if present, else exif_location, else "unknown"
-
-    Sequence split:
-    - within a group key, a new sequence starts when time gap > gap_seconds
-
-    Decision rules:
-    - If >=2 frames have animal with confidence >= low_conf => presence=present
-    - If only 1 such frame:
-      - confidence >= high_conf => presence=present
-      - low_conf <= confidence < high_conf => presence=possible + manual review
-    - If none => presence=absent if we saw explicit negatives, else unknown + manual review
-
-    Species:
-    - argmax over sum(confidence by species) among frames considered above (animal + >= low_conf)
-    - if top-2 within species_margin => species=unknown + manual review
-    """
-
-    grouped: dict[str, list[dict]] = {}
-    for row in rows:
-        group_key = (row.get("overlay_location") or row.get("exif_location") or "unknown").strip()
-        grouped.setdefault(group_key or "unknown", []).append(row)
-
-    for group_key, group_rows in grouped.items():
-        group_rows.sort(
-            key=lambda r: (
-                _parse_exif_datetime(r.get("exif_timestamp", "")) or datetime.min,
-                str(r.get("image_path", "")),
-            )
-        )
-
-        sequences: list[list[dict]] = []
-        current: list[dict] = []
-        last_dt: datetime | None = None
-
-        for row in group_rows:
-            dt = _parse_exif_datetime(row.get("exif_timestamp", ""))
-            if dt is None:
-                # Missing timestamp: isolate it as its own sequence.
-                if current:
-                    sequences.append(current)
-                    current = []
-                    last_dt = None
-                sequences.append([row])
-                continue
-
-            if last_dt is None:
-                current = [row]
-                last_dt = dt
-                continue
-
-            if dt - last_dt > timedelta(seconds=gap_seconds):
-                sequences.append(current)
-                current = [row]
-            else:
-                current.append(row)
-            last_dt = dt
-
-        if current:
-            sequences.append(current)
-
-        for seq_index, seq_rows in enumerate(sequences, start=1):
-            votes: list[_ImageVote] = []
-            unknown_votes = 0
-            for r in seq_rows:
-                vote = _effective_vote(r)
-                if vote is None:
-                    unknown_votes += 1
-                else:
-                    votes.append(vote)
-
-            positive = [v for v in votes if v.has_animal and v.confidence >= low_conf]
-            positive_count = len(positive)
-
-            presence = "unknown"
-            flag_review = False
-            reason_parts: list[str] = []
-
-            if positive_count >= 2:
-                presence = "present"
-            elif positive_count == 1:
-                if positive[0].confidence >= high_conf:
-                    presence = "present"
-                else:
-                    presence = "possible"
-                    flag_review = True
-                    reason_parts.append("single_frame_medium_confidence")
-            else:
-                any_negative = any(v.has_animal is False for v in votes)
-                if any_negative:
-                    presence = "absent"
-                else:
-                    presence = "unknown"
-                    flag_review = True
-                    reason_parts.append("missing_or_low_confidence")
-
-            species_scores: dict[str, float] = {}
-            for v in positive:
-                species_scores[v.species] = species_scores.get(v.species, 0.0) + float(v.confidence)
-
-            seq_species = "unknown"
-            seq_score = 0.0
-            if not species_scores:
-                seq_species = "none" if presence == "absent" else "unknown"
-            else:
-                ranked = sorted(species_scores.items(), key=lambda kv: kv[1], reverse=True)
-                (best_species, best_score) = ranked[0]
-                second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-                seq_species = best_species
-                seq_score = float(best_score)
-                if len(ranked) > 1 and best_score - second_score < species_margin:
-                    seq_species = "unknown"
-                    flag_review = True
-                    reason_parts.append("species_conflict")
-
-            disagreement = len({v.species for v in positive}) > 1 if positive else False
-            if unknown_votes:
-                flag_review = True
-                reason_parts.append("missing_votes")
-
-            seq_start_dt = _parse_exif_datetime(seq_rows[0].get("exif_timestamp", "")) if seq_rows else None
-            seq_start_ts = seq_start_dt.strftime("%Y:%m:%d %H:%M:%S") if seq_start_dt else ""
-            seq_id = f"{_slug(group_key)}_{seq_start_dt.strftime('%Y%m%d_%H%M%S') if seq_start_dt else 'no_ts'}_{seq_index}"
-
-            for r in seq_rows:
-                r["sequence_id"] = seq_id
-                r["sequence_size"] = len(seq_rows)
-                r["sequence_presence"] = presence
-                r["sequence_species"] = seq_species
-                r["sequence_species_score"] = round(seq_score, 4)
-                r["sequence_disagreement"] = disagreement
-                r["sequence_flag_manual_review"] = flag_review
-                r["sequence_reason"] = ",".join(reason_parts)
-                r["sequence_group_key"] = group_key
-                r["sequence_start_ts"] = seq_start_ts
 
 
 def parse_args() -> argparse.Namespace:
@@ -827,35 +588,6 @@ def parse_args() -> argparse.Namespace:
         help="Include EXIF timestamp in CSV output (if present).",
     )
     parser.add_argument(
-        "--sequence-to-csv",
-        action="store_true",
-        help="Add sequence-level aggregation columns based on EXIF timestamp + overlay/site id.",
-    )
-    parser.add_argument(
-        "--sequence-gap-seconds",
-        type=int,
-        default=int(env_default("BEAVER_SEQUENCE_GAP_SECONDS", "6")),
-        help="Max time gap (seconds) between frames in the same sequence (default: 6).",
-    )
-    parser.add_argument(
-        "--sequence-low-conf",
-        type=float,
-        default=float(env_default("BEAVER_SEQUENCE_LOW_CONF", "0.6")),
-        help="Per-frame confidence threshold for 'has animal' within a sequence (default: 0.6).",
-    )
-    parser.add_argument(
-        "--sequence-high-conf",
-        type=float,
-        default=float(env_default("BEAVER_SEQUENCE_HIGH_CONF", "0.8")),
-        help="Single-frame confidence threshold to still mark a sequence present (default: 0.8).",
-    )
-    parser.add_argument(
-        "--sequence-species-margin",
-        type=float,
-        default=float(env_default("BEAVER_SEQUENCE_SPECIES_MARGIN", "0.25")),
-        help="If top-2 species scores are within this margin, label unknown + manual review (default: 0.25).",
-    )
-    parser.add_argument(
         "--aws-region",
         default=env_default("AWS_REGION"),
         help="AWS region for Bedrock calls (e.g. us-east-2).",
@@ -948,15 +680,6 @@ def main() -> None:
                 rows.append(error_row(path, args.model_id, exc))
             completed += 1
             print(f"Processed {completed}/{total}: {path}")
-
-    if args.sequence_to_csv:
-        apply_sequence_aggregation(
-            rows,
-            gap_seconds=args.sequence_gap_seconds,
-            low_conf=args.sequence_low_conf,
-            high_conf=args.sequence_high_conf,
-            species_margin=args.sequence_species_margin,
-        )
 
     rows.sort(key=lambda row: row["image_path"])
     write_csv(rows, args.output)
