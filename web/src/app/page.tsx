@@ -161,6 +161,14 @@ function slug(value: string, maxLen: number = 48) {
   return (cleaned || "unknown").slice(0, maxLen);
 }
 
+function imageNameFromPath(path: string) {
+  const raw = (path || "").trim();
+  if (!raw) return "";
+  const noQuery = raw.split("?")[0] || raw;
+  const parts = noQuery.split(/[/\\\\]/);
+  return parts[parts.length - 1] || noQuery;
+}
+
 function escapeCsv(value: unknown) {
   const text = String(value ?? "");
   if (text.includes(",") || text.includes("\"") || text.includes("\n")) {
@@ -604,7 +612,7 @@ export default function Home() {
       return {
         id: `classify_${timestamp}_${index}`,
         image_path: result.filename || "",
-        filename: result.filename || "",
+        filename: imageNameFromPath(result.filename || ""),
         predicted_label: predictedLabel,
         review_label: predictedLabel,
         was_corrected: false,
@@ -1694,9 +1702,12 @@ export default function Home() {
                             >
                               <td className="px-3 py-2">
                                 <div className="font-semibold">
-                                  {row.filename || "image"}
+                                  {row.filename || imageNameFromPath(row.image_path) || "image"}
                                 </div>
-                                <div className="text-[10px] text-[hsl(var(--muted-foreground))]">
+                                <div
+                                  className="max-w-[360px] truncate text-[10px] text-[hsl(var(--muted-foreground))]"
+                                  title={row.image_path}
+                                >
                                   {row.image_path}
                                 </div>
                               </td>
