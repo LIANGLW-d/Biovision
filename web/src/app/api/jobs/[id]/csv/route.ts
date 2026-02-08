@@ -118,8 +118,26 @@ function voteForRow(row: Record<string, unknown>): Vote | null {
   const animalType = String(row.animal_type ?? "").trim();
   const animalGroup = String(row.animal_group ?? "").trim();
 
+  // Prefer explicit animal_type if present (job CSVs sometimes omit has_animal).
+  if (animalType) {
+    if (animalType === "No animal") {
+      return {
+        hasAnimal: false,
+        species: "none",
+        confidence: 0,
+        explicitNegative: true,
+      };
+    }
+    return {
+      hasAnimal: true,
+      species: animalType,
+      confidence: parseNumber(row.animal_confidence) ?? 0,
+      explicitNegative: false,
+    };
+  }
+
   if (hasAnimal === true) {
-    const species = (animalType && animalType !== "No animal" ? animalType : animalGroup) || "animal";
+    const species = animalGroup || "animal";
     return {
       hasAnimal: true,
       species,
@@ -128,7 +146,8 @@ function voteForRow(row: Record<string, unknown>): Vote | null {
     };
   }
 
-  if (hasAnimal === false || hasBeaver === false || animalType === "No animal") {
+  // Important: has_beaver=false does NOT mean "no animal", only "not beaver".
+  if (hasAnimal === false) {
     return {
       hasAnimal: false,
       species: "none",
@@ -153,7 +172,10 @@ function parseCsvWithHeaders(csvText: string): {
   records: Record<string, unknown>[];
 } {
   const headerRows = parse(csvText, { to_line: 1, relax_column_count: true }) as string[][];
-  const headers = (headerRows[0] ?? []).map((h) => String(h));
+  const headers = (headerRows[0] ?? []).map((h, idx) => {
+    const text = String(h);
+    return idx === 0 ? text.replace(/^\uFEFF/, "") : text;
+  });
   const records = parse(csvText, {
     columns: headers,
     from_line: 2,
