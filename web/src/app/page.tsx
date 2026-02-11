@@ -136,7 +136,11 @@ function parseExifTimestampToMs(value: string) {
   const m = text.match(
     /^(\d{4})[:\/-](\d{2})[:\/-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})/,
   );
-  if (!m) return null;
+  if (!m) {
+    // Backend returns ISO timestamps (e.g. 2024-09-10T00:03:56.000Z).
+    const parsed = Date.parse(text);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
   const y = Number(m[1]);
   const mo = Number(m[2]);
   const d = Number(m[3]);
