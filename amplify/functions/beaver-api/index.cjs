@@ -370,13 +370,49 @@ function buildCsv(results) {
 }
 
 async function processJob(params) {
-  const { jobId, files, s3Inputs, modelId, bucket, region, s3Region } = params;
+  const {
+    jobId,
+    files = [],
+    s3Inputs = [],
+    modelId,
+    bucket,
+    region,
+    s3Region,
+    manifestKey,
+    chunkIndex = 0,
+    chunkSize = 0,
+    totalImages: totalImagesFromPayload = 0,
+    progressBase = 0,
+  } = params;
   const jobClient = new S3Client({ region });
   const inputClient = new S3Client({ region: s3Region });
 
   await updateJob(jobId, { status: "running" });
 
-  const total = files.length + s3Inputs.length;
+  let effectiveS3Inputs = s3Inputs;
+  let totalJobImages = Number(totalImagesFromPayload || 0);
+  if (manifestKey) {
+    const manifestResp = await jobClient.send(
+      new GetObjectCommand({
+        Bucket: bucket,
+        Key: manifestKey,
+      }),
+    );
+    if (!manifestResp.Body) {
+      throw new Error("Job inputs manifest missing from S3.");
+    }
+    const manifestBuf = await streamToBuffer(manifestResp.Body);
+    const manifestAll = JSON.parse(manifestBuf.toString("utf8"));
+    if (!Array.isArray(manifestAll)) {
+      throw new Error("Invalid job inputs manifest.");
+    }
+    const perChunk = Math.max(1, Number(chunkSize || 0));
+    const start = Number(chunkIndex || 0) * perChunk;
+    effectiveS3Inputs = manifestAll.slice(start, start + perChunk);
+    if (!totalJobImages) totalJobImages = manifestAll.length;
+  }
+
+  const total = files.length + effectiveS3Inputs.length;
   let completed = 0;
   const eventGapSeconds = Number(process.env.BEAVER_SEQUENCE_EVENT_GAP_SECONDS || "30") || 30;
   const burstGapSeconds = Number(process.env.BEAVER_SEQUENCE_BURST_GAP_SECONDS || "6") || 6;
@@ -438,6 +474,16 @@ async function processJob(params) {
   let sequenceIndex = 0;
   let current = [];
   let lastMs = null;
+  const isChunked = Boolean(manifestKey);
+
+  async function maybeUpdateProgress() {
+    if (isChunked) {
+      const absolute = Math.min(totalJobImages, Number(progressBase || 0) + completed);
+      await updateJob(jobId, { status: "running", completed_images: absolute });
+      return;
+    }
+    await updateJob(jobId, { completed_images: completed });
+  }
 
   async function flushSequence() {
     if (current.length === 0) return;
@@ -484,7 +530,7 @@ async function processJob(params) {
       }
       completed += current.length;
       if (completed % 10 === 0 || completed === total) {
-        await updateJob(jobId, { completed_images: completed });
+        await maybeUpdateProgress();
       }
       current = [];
       lastMs = null;
@@ -509,7 +555,7 @@ async function processJob(params) {
 
     completed += current.length;
     if (completed % 10 === 0 || completed === total) {
-      await updateJob(jobId, { completed_images: completed });
+      await maybeUpdateProgress();
     }
     current = [];
     lastMs = null;
@@ -518,7 +564,7 @@ async function processJob(params) {
   // Upload inputs are already in memory. S3 inputs are fetched on demand.
   const items = [
     ...files.map((file) => ({ kind: "upload", file })),
-    ...s3Inputs.map((input) => ({ kind: "s3", input })),
+    ...effectiveS3Inputs.map((input) => ({ kind: "s3", input })),
   ];
 
   for (const item of items) {
@@ -572,7 +618,7 @@ async function processJob(params) {
           }),
         );
         if (completed % 10 === 0 || completed === total) {
-          await updateJob(jobId, { completed_images: completed });
+          await maybeUpdateProgress();
         }
         continue;
       }
@@ -640,8 +686,71 @@ async function processJob(params) {
   }
 
   await flushSequence();
+  if (!isChunked) {
+    const csv = buildCsv(results);
+    const csvKey = `jobs/${jobId}/results/results.csv`;
+    await jobClient.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: csvKey,
+        Body: csv,
+        ContentType: "text/csv",
+      }),
+    );
 
-  const csv = buildCsv(results);
+    await updateJob(jobId, {
+      status: "complete",
+      completed_images: completed,
+      results,
+      csv_s3_key: csvKey,
+      error: null,
+    });
+    return;
+  }
+
+  const existing = await getJob(jobId);
+  if (!existing) {
+    throw new Error(`Job not found while appending chunk: ${jobId}`);
+  }
+  const prevResults = Array.isArray(existing.results) ? existing.results : [];
+  const mergedResults = [...prevResults, ...results];
+  const newCompleted = Math.min(totalJobImages, Number(progressBase || 0) + completed);
+  const isLastChunk = newCompleted >= totalJobImages;
+
+  if (!isLastChunk) {
+    await updateJob(jobId, {
+      status: "running",
+      completed_images: newCompleted,
+      results: mergedResults,
+      error: null,
+    });
+
+    const queueUrl = process.env.BEAVER_JOB_QUEUE_URL;
+    if (!queueUrl) {
+      throw new Error("Missing BEAVER_JOB_QUEUE_URL for chunk continuation.");
+    }
+    const sqsClient = new SQSClient({ region });
+    await sqsClient.send(
+      new SendMessageCommand({
+        QueueUrl: queueUrl,
+        MessageBody: JSON.stringify({
+          jobId,
+          modelId,
+          bucket,
+          region,
+          s3Region,
+          manifest_key: manifestKey,
+          chunk_index: Number(chunkIndex || 0) + 1,
+          chunk_size: Number(chunkSize || 0),
+          total_images: totalJobImages,
+          progress_base: newCompleted,
+        }),
+      }),
+    );
+    return;
+  }
+
+  const csv = buildCsv(mergedResults);
   const csvKey = `jobs/${jobId}/results/results.csv`;
   await jobClient.send(
     new PutObjectCommand({
@@ -651,11 +760,10 @@ async function processJob(params) {
       ContentType: "text/csv",
     }),
   );
-
   await updateJob(jobId, {
     status: "complete",
-    completed_images: completed,
-    results,
+    completed_images: totalJobImages,
+    results: mergedResults,
     csv_s3_key: csvKey,
     error: null,
   });
@@ -839,6 +947,19 @@ async function handleJobs(event) {
       source: s3Path ? "s3" : "upload",
       totalImages: allInputs.length,
     });
+    const chunkSize = Math.max(
+      50,
+      Math.min(Number(process.env.BEAVER_JOB_CHUNK_SIZE || "250") || 250, 500),
+    );
+    const manifestKey = `jobs/${jobId}/meta/inputs.json`;
+    await jobClient.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: manifestKey,
+        Body: JSON.stringify(allInputs),
+        ContentType: "application/json",
+      }),
+    );
     const sqsClient = new SQSClient({ region });
     await sqsClient.send(
       new SendMessageCommand({
@@ -849,11 +970,20 @@ async function handleJobs(event) {
           bucket,
           region,
           s3Region,
-          s3Inputs: allInputs,
+          manifest_key: manifestKey,
+          chunk_index: 0,
+          chunk_size: chunkSize,
+          total_images: allInputs.length,
+          progress_base: 0,
         }),
       }),
     );
-    console.log("[jobs] enqueued", { jobId, total: allInputs.length });
+    console.log("[jobs] enqueued", {
+      jobId,
+      total: allInputs.length,
+      chunkSize,
+      chunks: Math.ceil(allInputs.length / chunkSize),
+    });
     return jsonResponse(202, {
       job_id: jobId,
       status: "queued",
@@ -1085,8 +1215,18 @@ exports.handler = async (event) => {
         if (!payload.jobId || !payload.modelId || !payload.bucket || !payload.region) {
           throw new Error("Invalid job payload.");
         }
+        const manifestKey = String(payload.manifest_key || "").trim();
+        const chunkIndex = Number(payload.chunk_index || 0) || 0;
+        const chunkSize = Number(payload.chunk_size || 0) || 0;
+        const totalImages = Number(payload.total_images || 0) || 0;
+        const progressBase = Number(payload.progress_base || 0) || 0;
         console.log("[jobs] dequeue", {
           jobId: payload.jobId,
+          manifest: Boolean(manifestKey),
+          chunkIndex,
+          chunkSize,
+          totalImages,
+          progressBase,
           total: Array.isArray(payload.s3Inputs) ? payload.s3Inputs.length : 0,
         });
         const s3Inputs = Array.isArray(payload.s3Inputs) ? payload.s3Inputs : [];
@@ -1098,6 +1238,11 @@ exports.handler = async (event) => {
           bucket: payload.bucket,
           region: payload.region,
           s3Region: payload.s3Region || payload.region,
+          manifestKey: manifestKey || undefined,
+          chunkIndex,
+          chunkSize,
+          totalImages,
+          progressBase,
         });
       } catch (error) {
         console.error("[jobs] queue processing error", error);
