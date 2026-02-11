@@ -143,11 +143,25 @@ function isBedrockOversizeError(error) {
 function buildErrorResult(filename, message, extra = {}) {
   return {
     filename,
-    is_beaver: false,
-    confidence: 0,
+    image_path: filename,
+    // Animal agent fields (Prompt 2, plus legacy fields used by the UI).
     common_name: "unknown",
     group: "unknown",
     notes: message,
+    confidence: 0,
+    has_animal: "",
+    animal_type: "",
+    animal_common_name: "",
+    animal_confidence: "",
+    animal_group: "",
+    animal_reason: "",
+    animal_notes: "",
+    // Beaver agent fields (Prompt 1).
+    is_beaver: false,
+    has_beaver: false,
+    beaver_confidence: 0,
+    beaver_reason: message,
+    reason: message,
     error: message,
     ...extra,
   };
@@ -252,22 +266,90 @@ async function runWithConcurrency(tasks, limit, onComplete) {
 }
 
 function buildCsv(results) {
+  // CSV schema aligned with the UI exporter + sequence aggregator.
   const headers = [
-    "filename",
-    "is_beaver",
+    "image_path",
+    "has_beaver",
     "confidence",
-    "common_name",
-    "group",
-    "notes",
+    "reason",
+    "bbox",
+    "has_animal",
+    "animal_type",
+    "manual_review",
+    "animal_group",
+    "animal_confidence",
+    "animal_reason",
     "overlay_location",
     "overlay_confidence",
     "overlay_reason",
     "overlay_temperature",
+    "model_id",
     "exif_timestamp",
+    "exif_location",
+    "error",
+    // Keep a few legacy columns at the end for debugging/back-compat.
+    "filename",
+    "is_beaver",
+    "beaver_confidence",
+    "beaver_reason",
+    "common_name",
+    "group",
+    "notes",
   ];
+
+  const rows = results.map((row) => {
+    const imagePath = String(row.image_path ?? row.filename ?? "");
+    const hasBeaver = Boolean(row.has_beaver ?? row.is_beaver ?? false);
+    const beaverConfidence =
+      typeof row.beaver_confidence === "number"
+        ? row.beaver_confidence
+        : typeof row.confidence === "number" && row.is_beaver === true
+          ? row.confidence
+          : 0;
+    const beaverReason = String(row.beaver_reason ?? row.reason ?? "");
+
+    const animalType = String(
+      row.animal_type ?? row.animal_common_name ?? row.common_name ?? "",
+    );
+    const hasAnimal =
+      typeof row.has_animal === "boolean"
+        ? row.has_animal
+        : animalType && animalType !== "No animal";
+
+    return {
+      image_path: imagePath,
+      has_beaver: hasBeaver,
+      confidence: beaverConfidence,
+      reason: beaverReason,
+      bbox: row.bbox ?? "",
+      has_animal: hasAnimal,
+      animal_type: animalType,
+      manual_review: row.manual_review ?? "",
+      animal_group: row.animal_group ?? row.group ?? "",
+      animal_confidence:
+        row.animal_confidence ?? (typeof row.confidence === "number" ? row.confidence : ""),
+      animal_reason: row.animal_reason ?? row.notes ?? "",
+      overlay_location: row.overlay_location ?? "",
+      overlay_confidence: row.overlay_confidence ?? "",
+      overlay_reason: row.overlay_reason ?? "",
+      overlay_temperature: row.overlay_temperature ?? "",
+      model_id: row.model_id ?? "",
+      exif_timestamp: row.exif_timestamp ?? "",
+      exif_location: row.exif_location ?? "",
+      error: row.error ?? "",
+      filename: row.filename ?? "",
+      is_beaver: row.is_beaver ?? "",
+      beaver_confidence: row.beaver_confidence ?? "",
+      beaver_reason: row.beaver_reason ?? "",
+      common_name: row.common_name ?? "",
+      group: row.group ?? "",
+      notes: row.notes ?? "",
+    };
+  });
+
   const lines = [
     headers.join(","),
-    ...results.map((row) =>
+    ...rows.map((row) =>
       headers
         .map((key) => {
           const value = String(row[key] ?? "");
@@ -310,6 +392,7 @@ async function processJob(params) {
         });
         return {
           filename: file.filename,
+          image_path: file.filename,
           ...output,
           s3_key: key,
         };
@@ -352,6 +435,7 @@ async function processJob(params) {
         });
         return {
           filename: path.basename(item.key),
+          image_path: path.basename(item.key),
           ...output,
           s3_key: item.key,
           s3_bucket: item.bucket,

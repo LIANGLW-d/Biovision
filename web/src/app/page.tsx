@@ -582,6 +582,12 @@ export default function Home() {
     common_name: string;
     group: string;
     notes: string;
+    beaver_confidence?: number;
+    beaver_reason?: string;
+    animal_common_name?: string;
+    animal_confidence?: number;
+    animal_group?: string;
+    animal_notes?: string;
     overlay_location?: string;
     overlay_confidence?: number;
     overlay_reason?: string;
@@ -590,23 +596,33 @@ export default function Home() {
   }>) => {
     const timestamp = Date.now();
     return items.map((result, index) => {
+      const animalCommonName = result.animal_common_name ?? result.common_name;
+      const animalConfidence = result.animal_confidence ?? result.confidence;
+      const animalGroup = result.animal_group ?? result.group;
+      const animalNotes = result.animal_notes ?? result.notes;
+      const beaverConfidence = result.beaver_confidence;
+      const beaverReason = result.beaver_reason;
+
       const post = postProcessAnimalOutput({
-        common_name: result.common_name,
-        confidence: result.confidence,
-        group: result.group,
-        notes: result.notes,
+        common_name: animalCommonName,
+        confidence: animalConfidence,
+        group: animalGroup,
+        notes: animalNotes,
       });
 
       let commonName = post.Common_Name;
       let manualReview = post.manual_review;
       let confidence = post.confidence;
-      let group = result.group;
+      let group = animalGroup;
+      let reason = animalNotes || "";
 
       if (result.is_beaver) {
         commonName = "Beaver";
         manualReview = false;
         group = "mammal";
-        confidence = result.confidence;
+        confidence =
+          typeof beaverConfidence === "number" ? beaverConfidence : animalConfidence;
+        reason = beaverReason || reason;
       } else if (commonName === "No animal") {
         group = "none";
       }
@@ -626,7 +642,7 @@ export default function Home() {
         review_label: predictedLabel,
         was_corrected: false,
         confidence,
-        reason: result.notes || "",
+        reason,
         notes: post.notes || "",
         model_id: "",
         has_beaver: result.is_beaver,
@@ -635,8 +651,8 @@ export default function Home() {
         manual_review: manualReview,
         animal_type: commonName,
         animal_group: group,
-        animal_confidence: confidence,
-        animal_reason: result.notes || "",
+        animal_confidence: animalConfidence,
+        animal_reason: animalNotes || "",
         bbox: "",
         overlay_location: result.overlay_location || "",
         overlay_confidence: result.overlay_confidence ?? "",

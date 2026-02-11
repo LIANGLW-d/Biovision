@@ -36,7 +36,6 @@ const CLASSIFY_PROMPT = [
   "Task:",
   "1) Decide if there is ANY animal in the image.",
   "2) If yes, identify the most likely species from the allowed list.",
-  "3) Decide if the animal is a beaver.",
   "",
   "Animal definition:",
   "- Any real animal (mammal or bird)",
@@ -52,10 +51,9 @@ const CLASSIFY_PROMPT = [
   "- Do NOT guess species if there is no clear visual evidence.",
   "- If you identify a species not on the list, choose \"other mammal\" or \"other bird\".",
   "- If there is no animal, set common_name to \"No animal\" and group to \"none\".",
-  "- If the common_name is \"Beaver\", is_beaver must be true.",
   "",
   "Return STRICT JSON only:",
-  "{\"is_beaver\": true/false, \"confidence\": 0-1, \"common_name\": \"...\", \"group\": \"mammal | bird | none | unknown\", \"notes\": \"short\"}",
+  "{\"confidence\": 0-1, \"common_name\": \"...\", \"group\": \"mammal | bird | none | unknown\", \"notes\": \"short\"}",
   "Output MUST start with { and end with } and contain nothing else.",
 ].join("\n");
 
