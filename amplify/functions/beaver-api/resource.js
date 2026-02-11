@@ -4,7 +4,8 @@ exports.beaverApi = defineFunction({
   name: "beaver-api",
   runtime: 18,
   entry: "./handler.mjs",
-  timeoutSeconds: 30,
+  // Batch jobs can take several minutes; allow the Lambda maximum (15 min).
+  timeoutSeconds: 900,
   memoryMB: 2048,
   bundling: {
     externalModules: [],
