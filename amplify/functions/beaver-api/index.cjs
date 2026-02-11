@@ -15,7 +15,12 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { parse: parseCsv } = require("csv-parse/sync");
 const { createAmazonBedrock } = require("@ai-sdk/amazon-bedrock");
 const { generateText } = require("ai");
-const { classifyImageBuffer, getSharpAvailability } = require("./lib/classify");
+const {
+  classifyImageBuffer,
+  classifySequenceBuffers,
+  extractExifTimestamp,
+  getSharpAvailability,
+} = require("./lib/classify");
 const { createJob, updateJob, getJob } = require("./lib/jobsDb");
 
 const bedrock = createAmazonBedrock({
@@ -373,11 +378,150 @@ async function processJob(params) {
 
   const total = files.length + s3Inputs.length;
   let completed = 0;
-  const concurrency = Number(process.env.BEAVER_JOB_CONCURRENCY || "3") || 3;
+  const eventGapSeconds = Number(process.env.BEAVER_SEQUENCE_EVENT_GAP_SECONDS || "30") || 30;
+  const burstGapSeconds = Number(process.env.BEAVER_SEQUENCE_BURST_GAP_SECONDS || "6") || 6;
 
-  const tasks = [
-    ...files.map((file) => async () => {
+  function parseTsMs(ts) {
+    const ms = Date.parse(String(ts || "").trim());
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  function pickTwoShots(frames) {
+    if (frames.length <= 2) return frames;
+    const msList = frames.map((f) => parseTsMs(f.exif_timestamp));
+    if (msList.some((v) => v == null)) {
+      return [frames[0], frames[frames.length - 1]];
+    }
+
+    let bestStart = 0;
+    let bestLen = 1;
+    let runStart = 0;
+    for (let i = 1; i < frames.length; i++) {
+      const gap = msList[i] - msList[i - 1];
+      if (gap <= burstGapSeconds * 1000) continue;
+      const runLen = i - runStart;
+      if (runLen > bestLen) {
+        bestLen = runLen;
+        bestStart = runStart;
+      }
+      runStart = i;
+    }
+    const lastRunLen = frames.length - runStart;
+    if (lastRunLen > bestLen) {
+      bestLen = lastRunLen;
+      bestStart = runStart;
+    }
+
+    if (bestLen >= 2) {
+      return [frames[bestStart], frames[bestStart + bestLen - 1]];
+    }
+    return [frames[0], frames[frames.length - 1]];
+  }
+
+  const results = [];
+  let sequenceIndex = 0;
+  let current = [];
+  let lastMs = null;
+
+  async function flushSequence() {
+    if (current.length === 0) return;
+    sequenceIndex += 1;
+
+    const startTs = current[0].exif_timestamp || "";
+    const startMs = parseTsMs(startTs);
+    const startId = startMs
+      ? new Date(startMs).toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_")
+      : "no_ts";
+    const seqId = `${jobId}_${startId}_${sequenceIndex}`;
+
+    const picked = pickTwoShots(current);
+    const allowOversizeNoSharp = current[0].allowOversizeNoSharp === true;
+
+    let seqOutput;
+    try {
+      seqOutput = await classifySequenceBuffers(
+        modelId,
+        picked.map((f) => f.buffer),
+        { allowOversizeNoSharp, maxImages: picked.length },
+      );
+    } catch (error) {
+      let message = error instanceof Error ? error.message : String(error);
+      if (isOversizeNoSharpError(error)) {
+        message =
+          "Image exceeds 5MB and sharp is unavailable. Please upload a smaller image or enable the sharp Lambda layer.";
+      } else if (isBedrockOversizeError(error)) {
+        message =
+          "Bedrock rejected the image because it exceeds 5MB. Enable the sharp Lambda layer or provide smaller images.";
+      }
+      for (const frame of current) {
+        results.push(
+          buildErrorResult(frame.filename, message, {
+            image_path: frame.image_path,
+            s3_key: frame.s3_key,
+            s3_bucket: frame.s3_bucket,
+            exif_timestamp: frame.exif_timestamp,
+            sequence_id: seqId,
+            sequence_size: current.length,
+            sequence_start_ts: startTs,
+          }),
+        );
+      }
+      completed += current.length;
+      if (completed % 10 === 0 || completed === total) {
+        await updateJob(jobId, { completed_images: completed });
+      }
+      current = [];
+      lastMs = null;
+      return;
+    }
+
+    for (const frame of current) {
+      results.push({
+        filename: frame.filename,
+        image_path: frame.image_path,
+        ...seqOutput,
+        exif_timestamp: frame.exif_timestamp,
+        s3_key: frame.s3_key,
+        s3_bucket: frame.s3_bucket,
+        sequence_id: seqId,
+        sequence_size: current.length,
+        sequence_start_ts: startTs,
+        sequence_event_gap_seconds: eventGapSeconds,
+        sequence_burst_gap_seconds: burstGapSeconds,
+      });
+    }
+
+    completed += current.length;
+    if (completed % 10 === 0 || completed === total) {
+      await updateJob(jobId, { completed_images: completed });
+    }
+    current = [];
+    lastMs = null;
+  }
+
+  // Upload inputs are already in memory. S3 inputs are fetched on demand.
+  const items = [
+    ...files.map((file) => ({ kind: "upload", file })),
+    ...s3Inputs.map((input) => ({ kind: "s3", input })),
+  ];
+
+  for (const item of items) {
+    let filename;
+    let imagePath;
+    let buffer;
+    let s3Key = "";
+    let s3Bucket = "";
+    let allowOversizeNoSharp = false;
+
+    if (item.kind === "upload") {
+      const file = item.file;
+      filename = file.filename;
+      imagePath = file.filename;
+      buffer = file.buffer;
+      allowOversizeNoSharp = false;
+
       const key = `jobs/${jobId}/input/${file.filename}`;
+      s3Key = key;
       await jobClient.send(
         new PutObjectCommand({
           Bucket: bucket,
@@ -386,86 +530,100 @@ async function processJob(params) {
           ContentType: file.mimeType || "application/octet-stream",
         }),
       );
-      try {
-        const output = await classifyImageBuffer(modelId, file.buffer, {
-          allowOversizeNoSharp: false,
-        });
-        return {
-          filename: file.filename,
-          image_path: file.filename,
-          ...output,
-          s3_key: key,
-        };
-      } catch (error) {
-        if (isOversizeNoSharpError(error)) {
-          return buildErrorResult(
-            file.filename,
-            "Image exceeds 5MB and sharp is unavailable. Please upload a smaller image or enable the sharp Lambda layer.",
-            { s3_key: key },
-          );
-        }
-        if (isBedrockOversizeError(error)) {
-          return buildErrorResult(
-            file.filename,
-            "Bedrock rejected the image because it exceeds 5MB. Enable the sharp Lambda layer or provide smaller images.",
-            { s3_key: key },
-          );
-        }
-        throw error;
-      }
-    }),
-    ...s3Inputs.map((item) => async () => {
+    } else {
+      const input = item.input;
+      filename = path.basename(input.key);
+      imagePath = filename;
+      s3Key = input.key;
+      s3Bucket = input.bucket;
+      allowOversizeNoSharp = true;
+
       const getResult = await inputClient.send(
         new GetObjectCommand({
-          Bucket: item.bucket,
-          Key: item.key,
+          Bucket: input.bucket,
+          Key: input.key,
         }),
       );
       const body = getResult.Body;
       if (!body) {
-        return buildErrorResult(path.basename(item.key), "Missing S3 body", {
-          s3_key: item.key,
-          s3_bucket: item.bucket,
-        });
-      }
-      const buffer = await streamToBuffer(body);
-      try {
-        const output = await classifyImageBuffer(modelId, buffer, {
-          allowOversizeNoSharp: true,
-        });
-        return {
-          filename: path.basename(item.key),
-          image_path: path.basename(item.key),
-          ...output,
-          s3_key: item.key,
-          s3_bucket: item.bucket,
-        };
-      } catch (error) {
-        if (isOversizeNoSharpError(error)) {
-          return buildErrorResult(
-            path.basename(item.key),
-            "Image exceeds 5MB and sharp is unavailable. Please upload a smaller image or enable the sharp Lambda layer.",
-            { s3_key: item.key, s3_bucket: item.bucket },
-          );
+        await flushSequence();
+        completed += 1;
+        results.push(
+          buildErrorResult(filename, "Missing S3 body", {
+            image_path: imagePath,
+            s3_key: s3Key,
+            s3_bucket: s3Bucket,
+          }),
+        );
+        if (completed % 10 === 0 || completed === total) {
+          await updateJob(jobId, { completed_images: completed });
         }
-        if (isBedrockOversizeError(error)) {
-          return buildErrorResult(
-            path.basename(item.key),
-            "Bedrock rejected the image because it exceeds 5MB. Enable the sharp Lambda layer or provide smaller images.",
-            { s3_key: item.key, s3_bucket: item.bucket },
-          );
-        }
-        throw error;
+        continue;
       }
-    }),
-  ];
-
-  const results = await runWithConcurrency(tasks, concurrency, async () => {
-    completed += 1;
-    if (completed % 10 === 0 || completed === total) {
-      await updateJob(jobId, { completed_images: completed });
+      buffer = await streamToBuffer(body);
     }
-  });
+
+    const exif = await extractExifTimestamp(buffer);
+    const ms = parseTsMs(exif);
+    if (ms == null) {
+      await flushSequence();
+      current = [
+        {
+          filename,
+          image_path: imagePath,
+          buffer,
+          s3_key: s3Key,
+          s3_bucket: s3Bucket,
+          exif_timestamp: exif || "",
+          allowOversizeNoSharp,
+        },
+      ];
+      await flushSequence();
+      continue;
+    }
+
+    if (current.length === 0) {
+      current.push({
+        filename,
+        image_path: imagePath,
+        buffer,
+        s3_key: s3Key,
+        s3_bucket: s3Bucket,
+        exif_timestamp: exif,
+        allowOversizeNoSharp,
+      });
+      lastMs = ms;
+      continue;
+    }
+
+    if (lastMs != null && ms - lastMs <= eventGapSeconds * 1000) {
+      current.push({
+        filename,
+        image_path: imagePath,
+        buffer,
+        s3_key: s3Key,
+        s3_bucket: s3Bucket,
+        exif_timestamp: exif,
+        allowOversizeNoSharp,
+      });
+      lastMs = ms;
+      continue;
+    }
+
+    await flushSequence();
+    current.push({
+      filename,
+      image_path: imagePath,
+      buffer,
+      s3_key: s3Key,
+      s3_bucket: s3Bucket,
+      exif_timestamp: exif,
+      allowOversizeNoSharp,
+    });
+    lastMs = ms;
+  }
+
+  await flushSequence();
 
   const csv = buildCsv(results);
   const csvKey = `jobs/${jobId}/results/results.csv`;
