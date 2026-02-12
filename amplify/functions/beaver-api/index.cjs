@@ -21,7 +21,13 @@ const {
   extractExifTimestamp,
   getSharpAvailability,
 } = require("./lib/classify");
-const { createJob, updateJob, getJob } = require("./lib/jobsDb");
+const {
+  claimFinalize,
+  createJob,
+  getJob,
+  markChunkComplete,
+  updateJob,
+} = require("./lib/jobsDb");
 
 const bedrock = createAmazonBedrock({
   region:
@@ -382,7 +388,7 @@ async function processJob(params) {
     chunkIndex = 0,
     chunkSize = 0,
     totalImages: totalImagesFromPayload = 0,
-    progressBase = 0,
+    totalChunks: totalChunksFromPayload = 1,
   } = params;
   const jobClient = new S3Client({ region });
   const inputClient = new S3Client({ region: s3Region });
@@ -477,11 +483,7 @@ async function processJob(params) {
   const isChunked = Boolean(manifestKey);
 
   async function maybeUpdateProgress() {
-    if (isChunked) {
-      const absolute = Math.min(totalJobImages, Number(progressBase || 0) + completed);
-      await updateJob(jobId, { status: "running", completed_images: absolute });
-      return;
-    }
+    if (isChunked) return;
     await updateJob(jobId, { completed_images: completed });
   }
 
@@ -584,6 +586,7 @@ async function processJob(params) {
 
       const key = `jobs/${jobId}/input/${file.filename}`;
       s3Key = key;
+      s3Bucket = bucket;
       await jobClient.send(
         new PutObjectCommand({
           Bucket: bucket,
@@ -708,65 +711,89 @@ async function processJob(params) {
     return;
   }
 
-  const existing = await getJob(jobId);
-  if (!existing) {
-    throw new Error(`Job not found while appending chunk: ${jobId}`);
-  }
-  const prevResults = Array.isArray(existing.results) ? existing.results : [];
-  const mergedResults = [...prevResults, ...results];
-  const newCompleted = Math.min(totalJobImages, Number(progressBase || 0) + completed);
-  const isLastChunk = newCompleted >= totalJobImages;
-
-  if (!isLastChunk) {
-    await updateJob(jobId, {
-      status: "running",
-      completed_images: newCompleted,
-      results: mergedResults,
-      error: null,
-    });
-
-    const queueUrl = process.env.BEAVER_JOB_QUEUE_URL;
-    if (!queueUrl) {
-      throw new Error("Missing BEAVER_JOB_QUEUE_URL for chunk continuation.");
-    }
-    const sqsClient = new SQSClient({ region });
-    await sqsClient.send(
-      new SendMessageCommand({
-        QueueUrl: queueUrl,
-        MessageBody: JSON.stringify({
-          jobId,
-          modelId,
-          bucket,
-          region,
-          s3Region,
-          manifest_key: manifestKey,
-          chunk_index: Number(chunkIndex || 0) + 1,
-          chunk_size: Number(chunkSize || 0),
-          total_images: totalJobImages,
-          progress_base: newCompleted,
-        }),
-      }),
-    );
-    return;
-  }
-
-  const csv = buildCsv(mergedResults);
-  const csvKey = `jobs/${jobId}/results/results.csv`;
+  const chunkId = String(Number(chunkIndex || 0)).padStart(6, "0");
+  const chunkResultKey = `jobs/${jobId}/results/chunks/${chunkId}.json`;
   await jobClient.send(
     new PutObjectCommand({
       Bucket: bucket,
-      Key: csvKey,
-      Body: csv,
-      ContentType: "text/csv",
+      Key: chunkResultKey,
+      Body: JSON.stringify(results),
+      ContentType: "application/json",
     }),
   );
-  await updateJob(jobId, {
-    status: "complete",
-    completed_images: totalJobImages,
-    results: mergedResults,
-    csv_s3_key: csvKey,
-    error: null,
+
+  const marked = await markChunkComplete({
+    jobId,
+    chunkIndex: Number(chunkIndex || 0),
+    processedImages: completed,
+    chunkS3Key: chunkResultKey,
   });
+  if (!marked.applied) {
+    // Duplicate redelivery; chunk already accounted for.
+    return;
+  }
+
+  const updatedJob = marked.job || (await getJob(jobId));
+  if (!updatedJob) {
+    throw new Error(`Job not found after chunk completion: ${jobId}`);
+  }
+
+  const completedChunks = Number(updatedJob.completed_chunks || 0);
+  const totalChunks = Math.max(1, Number(updatedJob.total_chunks || totalChunksFromPayload || 1));
+  if (completedChunks < totalChunks) {
+    return;
+  }
+
+  const claimed = await claimFinalize(jobId);
+  if (!claimed) {
+    return;
+  }
+
+  try {
+    const mergedResults = [];
+    for (let i = 0; i < totalChunks; i += 1) {
+      const key = `jobs/${jobId}/results/chunks/${String(i).padStart(6, "0")}.json`;
+      const response = await jobClient.send(
+        new GetObjectCommand({
+          Bucket: bucket,
+          Key: key,
+        }),
+      );
+      if (!response.Body) {
+        throw new Error(`Missing chunk output: ${key}`);
+      }
+      const body = await streamToBuffer(response.Body);
+      const parsed = JSON.parse(body.toString("utf8"));
+      if (Array.isArray(parsed)) {
+        mergedResults.push(...parsed);
+      }
+    }
+
+    const csv = buildCsv(mergedResults);
+    const csvKey = `jobs/${jobId}/results/results.csv`;
+    await jobClient.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: csvKey,
+        Body: csv,
+        ContentType: "text/csv",
+      }),
+    );
+    await updateJob(jobId, {
+      status: "complete",
+      completed_images: Number(updatedJob.total_images || totalJobImages),
+      results: mergedResults,
+      csv_s3_key: csvKey,
+      error: null,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateJob(jobId, {
+      status: "error",
+      error: `Finalization failed: ${message}`,
+    });
+    throw error;
+  }
 }
 
 async function handleClassify(event) {
@@ -946,11 +973,22 @@ async function handleJobs(event) {
       id: jobId,
       source: s3Path ? "s3" : "upload",
       totalImages: allInputs.length,
+      totalChunks: Math.max(
+        1,
+        Math.ceil(
+          allInputs.length /
+            Math.max(
+              50,
+              Math.min(Number(process.env.BEAVER_JOB_CHUNK_SIZE || "250") || 250, 500),
+            ),
+        ),
+      ),
     });
     const chunkSize = Math.max(
       50,
       Math.min(Number(process.env.BEAVER_JOB_CHUNK_SIZE || "250") || 250, 500),
     );
+    const totalChunks = Math.max(1, Math.ceil(allInputs.length / chunkSize));
     const manifestKey = `jobs/${jobId}/meta/inputs.json`;
     await jobClient.send(
       new PutObjectCommand({
@@ -961,28 +999,30 @@ async function handleJobs(event) {
       }),
     );
     const sqsClient = new SQSClient({ region });
-    await sqsClient.send(
-      new SendMessageCommand({
-        QueueUrl: queueUrl,
-        MessageBody: JSON.stringify({
-          jobId,
-          modelId,
-          bucket,
-          region,
-          s3Region,
-          manifest_key: manifestKey,
-          chunk_index: 0,
-          chunk_size: chunkSize,
-          total_images: allInputs.length,
-          progress_base: 0,
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      await sqsClient.send(
+        new SendMessageCommand({
+          QueueUrl: queueUrl,
+          MessageBody: JSON.stringify({
+            jobId,
+            modelId,
+            bucket,
+            region,
+            s3Region,
+            manifest_key: manifestKey,
+            chunk_index: chunkIndex,
+            chunk_size: chunkSize,
+            total_chunks: totalChunks,
+            total_images: allInputs.length,
+          }),
         }),
-      }),
-    );
+      );
+    }
     console.log("[jobs] enqueued", {
       jobId,
       total: allInputs.length,
       chunkSize,
-      chunks: Math.ceil(allInputs.length / chunkSize),
+      chunks: totalChunks,
     });
     return jsonResponse(202, {
       job_id: jobId,
@@ -1056,11 +1096,11 @@ async function handleUploadUrl(event) {
 
 async function handleImageUrl(event) {
   const query = event?.queryStringParameters || {};
-  const bucket = String(query.bucket || "").trim();
+  const bucket = String(query.bucket || "").trim() || requireEnv("BEAVER_JOB_BUCKET");
   const rawKey = String(query.key || "").trim();
   const key = rawKey ? decodeURIComponent(rawKey) : "";
-  if (!bucket || !key) {
-    return jsonResponse(400, { error: "Missing bucket or key." });
+  if (!key) {
+    return jsonResponse(400, { error: "Missing key." });
   }
 
   const region = requireEnv("AWS_REGION");
@@ -1249,15 +1289,15 @@ exports.handler = async (event) => {
         const manifestKey = String(payload.manifest_key || "").trim();
         const chunkIndex = Number(payload.chunk_index || 0) || 0;
         const chunkSize = Number(payload.chunk_size || 0) || 0;
+        const totalChunks = Number(payload.total_chunks || 0) || 1;
         const totalImages = Number(payload.total_images || 0) || 0;
-        const progressBase = Number(payload.progress_base || 0) || 0;
         console.log("[jobs] dequeue", {
           jobId: payload.jobId,
           manifest: Boolean(manifestKey),
           chunkIndex,
           chunkSize,
+          totalChunks,
           totalImages,
-          progressBase,
           total: Array.isArray(payload.s3Inputs) ? payload.s3Inputs.length : 0,
         });
         const s3Inputs = Array.isArray(payload.s3Inputs) ? payload.s3Inputs : [];
@@ -1272,11 +1312,12 @@ exports.handler = async (event) => {
           manifestKey: manifestKey || undefined,
           chunkIndex,
           chunkSize,
+          totalChunks,
           totalImages,
-          progressBase,
         });
       } catch (error) {
         console.error("[jobs] queue processing error", error);
+        throw error;
       }
     }
     return { statusCode: 200, body: "" };
