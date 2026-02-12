@@ -372,6 +372,7 @@ export default function Home() {
 
   const stats = useMemo(() => {
     let beavers = 0;
+    let animals = 0;
     let otherAnimals = 0;
     let noAnimals = 0;
     let manualReview = 0;
@@ -385,17 +386,27 @@ export default function Home() {
       if (row.manual_review) {
         manualReview += 1;
       }
-      if (row.review_label === "beaver") {
-        beavers += 1;
-      } else if (row.review_label === "other_animal") {
-        otherAnimals += 1;
+
+      const hasAnimal = row.animal_agent_label === "animal";
+      if (hasAnimal) {
+        animals += 1;
       } else {
         noAnimals += 1;
+      }
+
+      const hasBeaver = row.beaver_agent_label === "beaver";
+      if (hasBeaver) {
+        beavers += 1;
+      }
+
+      if (hasAnimal && !hasBeaver) {
+        otherAnimals += 1;
       }
     }
 
     return {
       total: results.length,
+      animals,
       beavers,
       otherAnimals,
       noAnimals,
@@ -921,7 +932,7 @@ export default function Home() {
 
   const loadRowImage = async (row: DetectionResult) => {
     if (rowImageUrls[row.id] || rowImageLoading[row.id]) return;
-    if (!row.s3_bucket || !row.s3_key) {
+    if (!row.s3_key) {
       setRowImageErrors((prev) => ({ ...prev, [row.id]: "Image preview unavailable." }));
       return;
     }
@@ -931,7 +942,9 @@ export default function Home() {
     try {
       const base = resolveBeaverApiBase().value;
       const url = new URL("/api/image-url", base);
-      url.searchParams.set("bucket", row.s3_bucket);
+      if (row.s3_bucket) {
+        url.searchParams.set("bucket", row.s3_bucket);
+      }
       url.searchParams.set("key", row.s3_key);
       url.searchParams.set("expires_in", "600");
       const response = await fetch(url.toString());
@@ -1575,7 +1588,7 @@ export default function Home() {
                       <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
                         <p className="text-xs uppercase text-[hsl(var(--muted-foreground))]">Animals</p>
                         <p className="text-xl font-semibold">
-                          {stats.beavers + stats.otherAnimals}
+                          {stats.animals}
                         </p>
                       </div>
                       <div className="rounded-2xl border border-[hsl(var(--border))] bg-white p-4">
