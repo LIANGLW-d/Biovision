@@ -1206,14 +1206,18 @@ async function handleChat(event) {
 
 function buildStats(rows) {
   const animalCounts = {};
+  const daily = {};
   let totalAnimals = 0;
   let totalBeavers = 0;
   let totalImages = rows.length;
+  let datedRows = 0;
 
   for (const row of rows) {
     const animalType = String(row.animal_type || "").toLowerCase().trim();
     const hasBeaver = String(row.has_beaver || "").toLowerCase() === "true";
     const hasAnimal = String(row.has_animal || "").toLowerCase() === "true";
+    const ms = parseChatTimestampMs(row.exif_timestamp);
+    const day = Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : "";
 
     if (hasBeaver) totalBeavers += 1;
 
@@ -1223,15 +1227,29 @@ function buildStats(rows) {
     } else if (hasAnimal) {
       totalAnimals += 1;
     }
+
+    if (day) {
+      datedRows += 1;
+      if (!daily[day]) {
+        daily[day] = { images: 0, animals: 0, beavers: 0 };
+      }
+      daily[day].images += 1;
+      if (hasAnimal) daily[day].animals += 1;
+      if (hasBeaver) daily[day].beavers += 1;
+    }
   }
 
   const sortedAnimals = Object.entries(animalCounts).sort((a, b) => b[1] - a[1]);
+  const sortedDaily = Object.entries(daily).sort((a, b) => a[0].localeCompare(b[0]));
   return {
     totalImages,
     totalAnimals,
     totalBeavers,
+    datedRows,
+    undatedRows: Math.max(0, totalImages - datedRows),
     animalCounts,
     sortedAnimals,
+    sortedDaily,
   };
 }
 
@@ -1239,6 +1257,11 @@ function buildSystemPrompt(stats) {
   const summaryLines = stats.sortedAnimals.map(([animal, count]) => `- ${animal}: ${count}`);
   const summaryText =
     summaryLines.length > 0 ? summaryLines.join("\n") : "- no animals detected";
+  const dailyLines = stats.sortedDaily.map(
+    ([day, s]) =>
+      `- ${day}: images=${s.images}, animals=${s.animals}, beavers=${s.beavers}`,
+  );
+  const dailyText = dailyLines.length > 0 ? dailyLines.join("\n") : "- no dated rows";
 
   return [
     "You are a wildlife dataset assistant.",
@@ -1246,9 +1269,31 @@ function buildSystemPrompt(stats) {
     `Total images: ${stats.totalImages}`,
     `Total animals (any type): ${stats.totalAnimals}`,
     `Beaver detections: ${stats.totalBeavers}`,
+    `Rows with timestamp: ${stats.datedRows}`,
+    `Rows without timestamp: ${stats.undatedRows}`,
     "Animal counts:",
     summaryText,
+    "Daily breakdown (YYYY-MM-DD):",
+    dailyText,
   ].join("\n");
+}
+
+function parseChatTimestampMs(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return NaN;
+  const iso = Date.parse(raw);
+  if (Number.isFinite(iso)) return iso;
+  const m = raw.match(
+    /^(\d{4})[:\-](\d{2})[:\-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/,
+  );
+  if (!m) return NaN;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  const h = Number(m[4]);
+  const mi = Number(m[5]);
+  const s = Number(m[6] || 0);
+  return Date.UTC(y, mo, d, h, mi, s);
 }
 
 function getLastUserText(messages) {
