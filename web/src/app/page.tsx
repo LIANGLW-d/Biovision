@@ -135,6 +135,31 @@ const REVIEW_LABELS = [
   { value: "no_animal", label: "No animal" },
 ];
 
+const ANIMAL_SPECIES_OPTIONS = [
+  "Beaver",
+  "Nutria",
+  "Raccoon",
+  "Black bear",
+  "Long-tailed weasel",
+  "Mink",
+  "River otter",
+  "Striped skunk",
+  "Bobcat",
+  "Mountain lion (Cougar)",
+  "Coyote",
+  "Elk",
+  "Mule and black-tailed deer",
+  "human",
+  "Band-tailed pigeon",
+  "Barred owl",
+  "Western screech-owl",
+  "Great blue heron",
+  "other mammal",
+  "other bird",
+  "unknown",
+  "No animal",
+];
+
 function parseExifTimestampToMs(value: string) {
   const text = (value || "").trim();
   if (!text) return null;
@@ -869,6 +894,33 @@ export default function Home() {
   const handleUpdateNotes = (id: string, notes: string) => {
     setResults((prev) =>
       prev.map((row) => (row.id === id ? { ...row, notes } : row)),
+    );
+  };
+
+  const handleUpdateSpecies = (id: string, species: string) => {
+    setResults((prev) =>
+      prev.map((row) => {
+        if (row.id !== id) return row;
+        const normalized = species || "unknown";
+        const noAnimal = normalized === "No animal";
+        const animalAgentLabel = noAnimal ? "no_animal" : "animal";
+        const hasAnimal = !noAnimal;
+        const nextReviewLabel = noAnimal
+          ? "no_animal"
+          : normalized === "Beaver"
+            ? "beaver"
+            : "other_animal";
+        const was_corrected = row.predicted_label !== nextReviewLabel;
+        return {
+          ...row,
+          Common_Name: noAnimal ? "NA" : normalized,
+          animal_type: normalized,
+          has_animal: hasAnimal,
+          animal_agent_label: animalAgentLabel,
+          review_label: nextReviewLabel,
+          was_corrected,
+        };
+      }),
     );
   };
 
@@ -1909,7 +1961,19 @@ export default function Home() {
                                 {row.confidence || 0}
                               </td>
                               <td className="px-2 py-2">
-                                {row.Common_Name || "unknown"}
+                                <select
+                                  value={row.animal_type || (row.Common_Name === "NA" ? "No animal" : row.Common_Name || "unknown")}
+                                  onChange={(event) =>
+                                    handleUpdateSpecies(row.id, event.target.value)
+                                  }
+                                  className="w-full min-w-[130px] rounded-xl border border-[hsl(var(--border))] bg-white px-2 py-1 text-xs"
+                                >
+                                  {ANIMAL_SPECIES_OPTIONS.map((species) => (
+                                    <option key={species} value={species}>
+                                      {species}
+                                    </option>
+                                  ))}
+                                </select>
                               </td>
                               <td className="px-2 py-2">
                                 <button
