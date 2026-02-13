@@ -1120,7 +1120,7 @@ export default function Home() {
         />
       )}
       <header className="px-6 py-6">
-        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4">
+        <div className="mx-auto flex w-full max-w-[90rem] items-center justify-between gap-4">
           <div>
             <p className="text-[10px] font-semibold uppercase tracking-[0.35em] text-[hsl(var(--muted-foreground))]">
               BIOVISION
@@ -1192,7 +1192,7 @@ export default function Home() {
           activeTab === "home" ? "bg-transparent" : ""
         }`}
       >
-        <div className="mx-auto flex w-full max-w-6xl flex-col">
+        <div className="mx-auto flex w-full max-w-[90rem] flex-col">
             {activeTab !== "home" && (
               <header className="flex flex-wrap items-start justify-between gap-4">
                 <div>
